@@ -1,0 +1,14 @@
+.git
+**/.baml
+**/.venv
+**/__pycache__
+**/node_modules
+**/dist
+.env*
+**/*.pem
+**/*.key
+
+**/.env
+**/.env.*
+**/*.egg-info
+**/build

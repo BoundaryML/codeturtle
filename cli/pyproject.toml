@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codeturtle"
+version = "0.1.0"
+description = "BAML policy review with authenticated CI reporting"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+readme = "README.md"
+
+[project.scripts]
+codeturtle = "codeturtle_runtime.git_input:main"
+
+[tool.setuptools]
+packages = ["codeturtle_runtime"]
+package-dir = {codeturtle_runtime = "."}
+
+[tool.setuptools.package-data]
+codeturtle_runtime = ["baml.toml", "baml_src/*.baml", "baml_src/ns_tests/*.baml", "baml_src/ns_tests/ns_integration/*.baml", "fixture/changes.json", "fixture/.github/codeturtle/*", "fixture/.github/codeturtle/ns_checks/ns_api/ns_compatibility/*.baml", "fixture/.github/codeturtle/ns_checks/ns_pr/*.baml"]

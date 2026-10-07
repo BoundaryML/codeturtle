@@ -1,0 +1,306 @@
+"""Disposable PostgreSQL + real BAML HTTP service; provider traffic stays on loopback.
+Run with CODETURTLE_TEST_SQL pointing to the operator handoff (.md or .sql).
+Requires PostgreSQL 17 tools, BAML and the pinned crypto requirements.
+"""
+import concurrent.futures
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import socket
+import subprocess
+import tempfile
+import threading
+import time
+import unittest
+import urllib.error
+import urllib.request
+import uuid
+import jwt
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+
+ROOT=Path(__file__).resolve().parents[2]
+
+class ServiceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        sql_path=os.environ.get('CODETURTLE_TEST_SQL')
+        if not sql_path: raise RuntimeError('Set CODETURTLE_TEST_SQL to the separate operator SQL handoff')
+        cls.temp=tempfile.TemporaryDirectory(prefix='codeturtle_test_');cls.addClassCleanup(cls.temp.cleanup)
+        cls.path=Path(cls.temp.name);cls.pg=cls.path/'pg';cls.sock=cls.path/'socket';cls.sock.mkdir()
+        cls.pg_bin=os.environ.get('PG_BIN','/opt/homebrew/opt/postgresql@17/bin')
+        cls.command([cls.pg_bin+'/initdb','-D',str(cls.pg),'-A','trust','--no-locale'])
+        cls.command([cls.pg_bin+'/pg_ctl','-D',str(cls.pg),'-l',str(cls.path/'postgres.log'),'-o',f'-k {cls.sock} -h ""','-w','start'])
+        cls.addClassCleanup(lambda: cls.command([cls.pg_bin+'/pg_ctl','-D',str(cls.pg),'-m','immediate','-w','stop']))
+        cls.db='codeturtle_test_'+uuid.uuid4().hex
+        cls.sql('CREATE ROLE anon; CREATE ROLE authenticated; CREATE ROLE service_role;',database='postgres')
+        cls.sql('CREATE DATABASE '+cls.db,database='postgres')
+        sql=Path(sql_path).read_text();sql=sql.split('```sql\n')[1].split('```')[0] if '```sql' in sql else sql
+        cls.sql(sql);cls.sql(sql) # setup is rerunnable
+        cls.key=rsa.generate_private_key(public_exponent=65537,key_size=2048)
+        cls.pem=cls.key.private_bytes(serialization.Encoding.PEM,serialization.PrivateFormat.PKCS8,serialization.NoEncryption()).decode()
+        cls.jwk=json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(cls.key.public_key()));cls.jwk['kid']='test'
+        (cls.path/'key.pem').write_text(cls.pem)
+        cls.repo=cls.path/'repo';cls.repo.mkdir()
+        cls.command(['git','init','-b','main',str(cls.repo)])
+        policy=cls.repo/'.github/codeturtle';policy.mkdir(parents=True);(policy/'OWNERS').write_text('* @one\n')
+        (cls.repo/'a.txt').write_text('before\n');cls.git('add','.');cls.git('commit','-m','Base');cls.base=cls.git('rev-parse','HEAD').strip()
+        (cls.repo/'a.txt').write_text('after\n');cls.git('add','.');cls.git('commit','-m','Head');cls.head=cls.git('rev-parse','HEAD').strip()
+        cls.identity={'repository_id':'42','repository':'acme/repo','pr':7,'run_id':'123','run_attempt':1,'head':cls.head,'base':cls.base,'policy':cls.base}
+        cls.comments=[];cls.posts=0;cls.fail_post=False;cls.provider_down=False;cls.live_head=cls.head
+        outer=cls
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self,*args): pass
+            def do_GET(self):
+                if self.path.startswith('/oidc'):
+                    claims=outer.claims();self.send_json(200,{'value':jwt.encode(claims,outer.pem,algorithm='RS256',headers={'kid':'test'})})
+                else:self.send_json(404,{})
+            def do_POST(self):
+                raw=self.rfile.read(int(self.headers.get('Content-Length','0')))
+                data=json.loads(raw)
+                try:
+                    if self.path.startswith('/rest/v1/rpc/ct_'):
+                        name=self.path.rsplit('/',1)[1]
+                        if not name.replace('_','').isalnum():raise ValueError()
+                        result=outer.rpc(name,data['p']);self.send_json(200,result)
+                    elif self.path=='/provider':self.send_json(200,outer.provider(data))
+                    else:self.send_json(404,{})
+                except Exception:self.send_json(503,{'error':'fixture_failure'})
+            def send_json(self,status,data):
+                body=json.dumps(data).encode();self.send_response(status);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+        cls.mock=ThreadingHTTPServer(('127.0.0.1',0),Handler);cls.addClassCleanup(cls.mock.server_close);cls.addClassCleanup(cls.mock.shutdown)
+        threading.Thread(target=cls.mock.serve_forever,daemon=True).start();cls.mock_url=f'http://127.0.0.1:{cls.mock.server_port}'
+        sock=socket.socket();sock.bind(('127.0.0.1',0));cls.port=sock.getsockname()[1];sock.close();cls.origin=f'http://127.0.0.1:{cls.port}'
+        cls.enrollment={'repository_id':'42','repository':'acme/repo','tenant_id':'tenant','installation_id':9,'workflow_ref':'acme/repo/.github/workflows/codeturtle.yml@refs/heads/main','workflow_blob':'c'*40,'active':True,'slack':None}
+        cls.project=cls.path/'backend';shutil.copytree(ROOT/'backend/baml_src',cls.project/'baml_src');shutil.copy(ROOT/'backend/baml.toml',cls.project/'baml.toml')
+        fixture='''class FixtureTransport { url: string, implements Transport { function send(self, method: string, url: string, token: string, payload: json) -> json { let r = baml.http.send(baml.http.Request.from_url(self.url + "/provider").set_method("POST").set_body(baml.json.stringify({"method": method, "url": url, "token": token, "payload": payload}))); require(r.status_code == 200, 503, "fixture_provider_unavailable"); baml.json.parse(r.text()) } } }
+function test_main(addr: string, fixture_url: string, python: string, crypto_path: string, models_path: string, key_path: string, origin: string) -> never {
+ let http = FixtureTransport {url: fixture_url}; let crypto = CryptoHelper {python: python, path: crypto_path};
+ let app = ReportService {store: SupabaseStore {url: fixture_url, key: "fixture"}, github: GitHubClient {http: http, crypto: crypto, app_id: "test", private_key: baml.fs.read(key_path), bot_id: 999}, oidc: GitHubOIDC {http: http, crypto: crypto, audience: origin}, parser: report_parser(models_path), origin: origin, slack: SlackClient {http: http, secrets: SecretBox {key: uint8array.zeroes(32)}}, browser: BrowserAuth {store: SupabaseStore {url: fixture_url, key: "fixture"}, http: http, origin: origin, client_id: "test", client_secret: "test", secrets: SecretBox {key: uint8array.zeroes(32)}}, onboarding: null};
+ baml.http.Server.bind(addr).serve((req) -> {app.handle(req)}, max_body_size = 4194304)
+}
+function test_delivery(fixture_url: string, python: string, crypto_path: string, models_path: string, key_path: string, origin: string) -> void {
+ let http = FixtureTransport {url: fixture_url}; let crypto = CryptoHelper {python: python, path: crypto_path};
+ let app = ReportService {store: SupabaseStore {url: fixture_url, key: "fixture"}, github: GitHubClient {http: http, crypto: crypto, app_id: "test", private_key: baml.fs.read(key_path), bot_id: 999}, oidc: GitHubOIDC {http: http, crypto: crypto, audience: origin}, parser: report_parser(models_path), origin: origin, slack: SlackClient {http: http, secrets: SecretBox {key: uint8array.zeroes(32)}}, browser: BrowserAuth {store: SupabaseStore {url: fixture_url, key: "fixture"}, http: http, origin: origin, client_id: "test", client_secret: "test", secrets: SecretBox {key: uint8array.zeroes(32)}}, onboarding: null}; app.deliver_once()
+}'''
+        (cls.project/'baml_src/fixture.baml').write_text(fixture)
+        cls.env=dict(os.environ,BAML_VERSION='0.20.2-nightly.20261004.a')
+        cls.args=['--fixture_url',cls.mock_url,'--python',str(ROOT/'backend/.venv/bin/python'),'--crypto_path',str(ROOT/'backend/crypto.py'),'--models_path',str(ROOT/'cli/baml_src/models.baml'),'--key_path',str(cls.path/'key.pem'),'--origin',cls.origin]
+        cls.log=open(cls.path/'service.log','w+');cls.addClassCleanup(cls.log.close)
+        cls.start_service();cls.addClassCleanup(cls.stop_service)
+    @classmethod
+    def command(cls,args,**kwargs):
+        return subprocess.run(args,check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,**kwargs).stdout
+    @classmethod
+    def sql(cls,query,database=None):
+        return cls.command([cls.pg_bin+'/psql','-X','-A','-t','-v','ON_ERROR_STOP=1','-h',str(cls.sock),'-d',database or cls.db],input=query).strip()
+    @classmethod
+    def rpc(cls,name,p):
+        literal=json.dumps(p).replace("'","''")
+        return json.loads(cls.sql("SELECT public."+name+"('"+literal+"'::jsonb)") or "null")
+    @classmethod
+    def git(cls,*args):
+        return cls.command(['git','-C',str(cls.repo),'-c','user.name=Test','-c','user.email=test@example.test','-c','commit.gpgsign=false','-c','core.hooksPath=/dev/null',*args])
+    @classmethod
+    def start_service(cls):
+        cls.process=subprocess.Popen(['baml','--agent-skill-check','off','run','--project',str(cls.project),'test_main','--','--addr',f'127.0.0.1:{cls.port}',*cls.args],env=cls.env,stdout=cls.log,stderr=cls.log)
+        for _ in range(100):
+            if cls.process.poll() is not None:
+                cls.log.seek(0);raise RuntimeError(cls.log.read())
+            try:
+                urllib.request.urlopen(cls.origin+'/healthz',timeout=.2).close();return
+            except (OSError,urllib.error.URLError):time.sleep(.1)
+        raise RuntimeError('BAML service did not start')
+    @classmethod
+    def stop_service(cls):
+        if cls.process.poll() is None:
+            cls.process.terminate()
+            try:cls.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:cls.process.kill();cls.process.wait()
+    @classmethod
+    def claims(cls):
+        return {'iss':'https://token.actions.githubusercontent.com','aud':cls.origin,'sub':'repo:acme/repo:ref:refs/heads/main','iat':int(time.time())-1,'exp':int(time.time())+120,'repository_id':'42','repository':'acme/repo','run_id':'123','run_attempt':'1','event_name':'pull_request_target','runner_environment':'github-hosted','sha':cls.base,'workflow_sha':cls.base,'workflow_ref':cls.enrollment['workflow_ref'],'ref':'refs/heads/main'}
+    @classmethod
+    def provider(cls,data):
+        if cls.provider_down:raise ValueError()
+        url=data['url'];method=data['method']
+        if url == 'https://api.workos.com/user_management/authenticate':
+            return {'user':{'id':'workos-user','email_verified':data['payload']['code']!='unverified'},'organization_id':'tenant'}
+        if url.endswith('/.well-known/jwks'):return {'keys':[cls.jwk]}
+        if url.endswith('/access_tokens'):return {'token':'installation'}
+        if url.endswith('/repos/acme/repo'):return {'id':42,'permissions':{'admin':True,'pull':True},'default_branch':'main'}
+        if '/contents/' in url:return {'sha':'c'*40}
+        if '/actions/runs/' in url:return {'id':123,'run_attempt':1,'event':'pull_request_target','head_sha':cls.base,'path':'.github/workflows/codeturtle.yml','status':'in_progress','pull_requests':[{'number':7,'base':{'repo':{'id':42}}}]}
+        if url.endswith('/pulls/7'):return {'state':'open','head':{'sha':cls.live_head},'base':{'sha':cls.base,'ref':'main','repo':{'id':42}},'title':'Test PR'}
+        if '/compare/' in url:return {'merge_base_commit':{'sha':cls.base}}
+        if '/comments?' in url:return cls.comments
+        if '/comments' in url:
+            if method=='POST':
+                cls.posts+=1;comment={'id':cls.posts,'user':{'id':999},'body':data['payload']['body']};cls.comments.append(comment)
+                if cls.fail_post:cls.fail_post=False;raise ValueError()
+                return comment
+            if method=='PATCH':cls.comments[0]['body']=data['payload']['body'];return cls.comments[0]
+        raise ValueError(url)
+    def setUp(self):
+        self.sql('TRUNCATE codeturtle_private.deliveries,codeturtle_private.runs,codeturtle_private.enrollments,codeturtle_private.memberships,codeturtle_private.setups CASCADE')
+        literal=json.dumps(self.enrollment).replace("'","''");self.sql("INSERT INTO codeturtle_private.enrollments VALUES('42','"+literal+"')")
+        type(self).comments=[];type(self).posts=0;type(self).fail_post=False;type(self).provider_down=False;type(self).live_head=self.head
+    def request(self,path,token='',body=None,method=None,headers=None):
+        raw=body if isinstance(body,bytes) else json.dumps(body).encode() if body is not None else None
+        req=urllib.request.Request(self.origin+path,data=raw,method=method,headers={'Authorization':'Bearer '+token,'Content-Type':'application/json',**(headers or {})})
+        try:
+            with urllib.request.urlopen(req,timeout=20) as r:return r.status,json.load(r)
+        except urllib.error.HTTPError as e:return e.code,json.load(e)
+    def register(self,claims=None):
+        token=jwt.encode(claims or self.claims(),self.pem,algorithm='RS256',headers={'kid':'test'})
+        status,data=self.request('/v1/runs',token,self.identity)
+        self.assertEqual(status,200,data);return data
+    def envelope(self,grant):
+        return {'schema_version':1,'cli_version':'0.1.0','run_id':grant['run_id'],'identity':self.identity,'report':{'context':{'base_revision':self.base,'head_revision':self.head,'policy_revision':self.base,'merge_base':self.base,'policy_source':'base_revision'},'requirements':[],'evaluations':[],'errors':[],'unowned_files':[],'evaluation_complete':True},'setup_failure':None}
+    def upload(self,grant,body):return self.request('/v1/runs/'+grant['run_id']+'/report',grant['token'],body,'PUT')
+    def test_identity_and_signature(self):
+        for change in [{'aud':'wrong'},{'repository_id':'99'},{'event_name':'pull_request'},{'runner_environment':'self-hosted'},{'exp':0}]:
+            token=jwt.encode(dict(self.claims(),**change),self.pem,algorithm='RS256',headers={'kid':'test'})
+            status,_=self.request('/v1/runs',token,self.identity);self.assertIn(status,[401,403])
+    def test_upload_and_duplicate_conflict(self):
+        g=self.register();e=self.envelope(g);a=self.upload(g,e);b=self.upload(g,e);self.assertEqual(a,b);self.assertEqual(a[0],202,a)
+        e['cli_version']='changed';self.assertEqual(self.upload(g,e)[0],409)
+        self.assertEqual(self.sql('SELECT count(*) FROM codeturtle_private.deliveries'),'1')
+    def test_concurrent_upload(self):
+        g=self.register();e=self.envelope(g)
+        with concurrent.futures.ThreadPoolExecutor(4) as pool:results=list(pool.map(lambda _:self.upload(g,e),range(4)))
+        self.assertTrue(all(r==results[0] for r in results));self.assertEqual(results[0][0],202,results)
+    def test_rotation_and_expiry(self):
+        old=self.register();new=self.register();self.assertEqual(old['run_id'],new['run_id']);self.assertEqual(self.upload(old,self.envelope(old))[0],401)
+        self.sql('UPDATE codeturtle_private.runs SET expires_at=0');self.assertEqual(self.upload(new,self.envelope(new))[0],401)
+    def test_stale_head(self):
+        g=self.register();type(self).live_head='d'*40;self.assertEqual(self.upload(g,self.envelope(g))[0],409)
+    def test_invalid_report(self):
+        g=self.register();e=self.envelope(g);e['report']['context']['policy_source']='local_preview';self.assertEqual(self.upload(g,e)[0],400)
+        e=self.envelope(g);e['report']['unowned_files']=['a.txt'];self.assertEqual(self.upload(g,e)[0],400)
+    def test_setup_failure(self):
+        g=self.register();e=self.envelope(g);e['report']=None;e['setup_failure']={'code':'evaluation_setup_failed','message':'failed'};self.assertEqual(self.upload(g,e)[0],202)
+    def test_revoke(self):
+        g=self.register();self.sql("UPDATE codeturtle_private.enrollments SET config=jsonb_set(config,'{active}','false')");self.assertEqual(self.upload(g,self.envelope(g))[0],403)
+    def test_database_permissions(self):
+        for role in ['anon','authenticated']:
+            with self.assertRaises(subprocess.CalledProcessError):self.sql('SET ROLE '+role+"; SELECT public.ct_ready('{}');")
+        self.assertEqual(json.loads(self.sql("SET ROLE service_role; SELECT public.ct_ready('{}');").splitlines()[-1]),{'ready':True})
+    def test_restart_preserves_receipt(self):
+        g=self.register();e=self.envelope(g);first=self.upload(g,e);self.stop_service();self.start_service();self.assertEqual(first,self.upload(g,e))
+    def test_cli_real_evaluation(self):
+        event={'repository':{'id':42,'full_name':'acme/repo'},'pull_request':{'number':7,'head':{'sha':self.head},'base':{'sha':self.base,'repo':{'id':42}}}}
+        event_path=self.path/'event.json';event_path.write_text(json.dumps(event))
+        env=dict(self.env,GITHUB_ACTIONS='true',GITHUB_EVENT_NAME='pull_request_target',GITHUB_EVENT_PATH=str(event_path),GITHUB_REPOSITORY='acme/repo',GITHUB_REPOSITORY_ID='42',GITHUB_RUN_ID='123',GITHUB_RUN_ATTEMPT='1',ACTIONS_ID_TOKEN_REQUEST_URL=self.mock_url+'/oidc',ACTIONS_ID_TOKEN_REQUEST_TOKEN='fixture',CODETURTLE_API_URL=self.origin,CODETURTLE_TEST_LOOPBACK='1')
+        r=subprocess.run(['python3',str(ROOT/'cli/git_input.py'),'check','--report','--repo',str(self.repo),'--mode','json'],env=env,capture_output=True,text=True)
+        self.assertEqual(r.returncode,0,r.stdout+r.stderr);self.assertTrue(json.loads(r.stdout)['evaluation_complete']);self.assertIn('accepted report',r.stderr)
+    def delivery(self):self.command(['baml','--agent-skill-check','off','run','--project',str(self.project),'test_delivery','--',*self.args],env=self.env)
+    def test_lost_provider_response_reconciles(self):
+        g=self.register();self.assertEqual(self.upload(g,self.envelope(g))[0],202)
+        type(self).fail_post=True;self.delivery();self.assertEqual(self.posts,1)
+        self.sql("UPDATE codeturtle_private.deliveries SET next_at=now()")
+        self.delivery();self.assertEqual(self.posts,1);self.assertEqual(self.sql('SELECT status FROM codeturtle_private.deliveries'),'delivered')
+    def test_lease_recovery(self):
+        g=self.register();self.upload(g,self.envelope(g));lease=self.rpc('ct_lease',{});self.assertIsNotNone(lease)
+        self.assertIsNone(self.rpc('ct_lease',{}));self.sql("UPDATE codeturtle_private.deliveries SET lease_until=now()-interval '1 second'")
+        self.delivery();self.assertEqual(self.posts,1)
+
+    def test_supersession_preserves_live_lease(self):
+        g=self.register();self.upload(g,self.envelope(g));lease=self.rpc('ct_lease',{})
+        identity=dict(self.identity,run_attempt=2)
+        authorized={'identity':identity,'enrollment':self.enrollment,'merge_base':self.base,'title':'Test PR'}
+        newer=self.rpc('ct_register',{'authorized':authorized,'token_hash':'new','expires_at':int(time.time())+900})
+        envelope=self.envelope(g);envelope['identity']=identity;envelope['run_id']=newer['id']
+        self.rpc('ct_accept',{'id':newer['id'],'token_hash':'new','digest':'new-digest','envelope':envelope})
+        self.assertIsNone(self.rpc('ct_lease',{}))
+        self.rpc('ct_delivery_done',{'id':g['run_id'],'destination':'github','lease':lease['lease'],'reference':{'id':1}})
+        next_lease=self.rpc('ct_lease',{});self.assertEqual(next_lease['run']['id'],newer['id'])
+
+    def test_transaction_rolls_back_outbox_failure(self):
+        g=self.register()
+        self.sql("CREATE FUNCTION codeturtle_private.test_fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'test rollback'; END $$; CREATE TRIGGER test_fail BEFORE INSERT ON codeturtle_private.deliveries FOR EACH ROW EXECUTE FUNCTION codeturtle_private.test_fail();")
+        try:
+            self.assertEqual(self.upload(g,self.envelope(g))[0],503)
+            self.assertEqual(self.sql('SELECT count(*) FROM codeturtle_private.runs WHERE digest IS NOT NULL'),'0')
+        finally:self.sql('DROP TRIGGER test_fail ON codeturtle_private.deliveries; DROP FUNCTION codeturtle_private.test_fail();')
+
+    def test_tenant_isolation_and_oauth_replay(self):
+        g=self.register();self.upload(g,self.envelope(g))
+        self.sql("INSERT INTO codeturtle_private.memberships(user_id,tenant_id,repository_id,github_user_id,can_setup) VALUES('user','tenant','42','1',true)")
+        good={'user_id':'user','tenant_id':'tenant'}
+        view=self.rpc('ct_review',{'actor':good,'id':g['run_id']});self.assertEqual(view['identity'],self.identity)
+        self.assertNotIn('token_hash',json.dumps(view));self.assertNotIn('enrollment',view)
+        for actor in [{'user_id':'other','tenant_id':'tenant'},{'user_id':'user','tenant_id':'other'}]:
+            self.assertEqual(self.rpc('ct_review',{'actor':actor,'id':g['run_id']})['status'],403)
+        self.rpc('ct_oauth_put',{'hash':'state','purpose':'workos','data':{'test':True},'expires_at':int(time.time())+60})
+        self.assertEqual(self.rpc('ct_oauth_take',{'hash':'state','purpose':'workos'}),{'test':True})
+        self.assertEqual(self.rpc('ct_oauth_take',{'hash':'state','purpose':'workos'})['status'],403)
+
+    def test_expired_unreported_run_is_visible(self):
+        self.register();self.sql("UPDATE codeturtle_private.runs SET created_at=now()-interval '3 hours'")
+        self.rpc('ct_lease',{})
+        self.assertEqual(self.sql('SELECT superseded FROM codeturtle_private.runs'),'t')
+
+
+    def test_browser_access_and_csrf(self):
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCMSIV
+        import hashlib
+        g=self.register();self.upload(g,self.envelope(g))
+        token='a'*64;actor={'user_id':'user','tenant_id':'tenant'}
+        self.rpc('ct_session_put',{'token_hash':hashlib.sha256(token.encode()).hexdigest(),'actor':actor,'csrf':'csrf','expires_at':int(time.time())+60})
+        sealed='00'*12+':'+AESGCMSIV(bytes(32)).encrypt(bytes(12),b'github-user-token',b'github-user:user:42').hex()
+        self.sql("INSERT INTO codeturtle_private.memberships VALUES('user','tenant','42','1',true,'"+sealed+"')")
+        cookie={'Cookie':'__Host-ct_session='+token}
+        self.assertEqual(self.request('/api/review?run='+g['run_id'])[0],401)
+        status,view=self.request('/api/review?run='+g['run_id'],headers=cookie);self.assertEqual(status,200,view);self.assertEqual(view['identity'],self.identity)
+        self.assertNotIn('encrypted_token',json.dumps(view))
+        status,_=self.request('/api/slack/mapping',body={'repository_id':'42','owner':'@one','user_id':'U123','channel':'C123'},headers=cookie)
+        self.assertEqual(status,403)
+        self.sql("DELETE FROM codeturtle_private.memberships")
+        self.assertEqual(self.request('/api/review?run='+g['run_id'],headers=cookie)[0],403)
+
+
+    def auth_request(self,path,cookie=None):
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self,*args,**kwargs):return None
+        request=urllib.request.Request(self.origin+path,headers={'Cookie':cookie} if cookie else {})
+        try:
+            response=urllib.request.build_opener(NoRedirect).open(request,timeout=10)
+        except urllib.error.HTTPError as error:
+            response=error
+        with response:return response.status,dict(response.headers),response.read()
+
+    def test_workos_callback_creates_secure_session_and_rejects_replay(self):
+        import urllib.parse
+        status,headers,_=self.auth_request('/auth/login')
+        self.assertEqual(status,302)
+        location=urllib.parse.urlsplit(headers['location'])
+        self.assertEqual(location.netloc,'api.workos.com')
+        query=urllib.parse.parse_qs(location.query)
+        self.assertEqual(query['redirect_uri'],[self.origin+'/auth/callback'])
+        state=query['state'][0]
+        cookie=headers['set-cookie'].split(';')[0]
+        callback='/auth/callback?state='+state+'&code=valid'
+        self.assertEqual(self.auth_request(callback)[0],403)
+        status,headers,_=self.auth_request(callback,cookie)
+        self.assertEqual(status,302)
+        for flag in ['Secure','HttpOnly','SameSite=Lax','Path=/']:
+            self.assertIn(flag,headers['set-cookie'])
+        session_cookie=headers['set-cookie'].split(';')[0]
+        status,session=self.request('/api/session',headers={'Cookie':session_cookie})
+        self.assertEqual(status,200,session)
+        self.assertEqual(len(session['csrf']),64)
+        self.assertEqual(self.auth_request(callback,cookie)[0],403)
+
+    def test_workos_rejects_unverified_email(self):
+        import urllib.parse
+        _,headers,_=self.auth_request('/auth/login')
+        state=urllib.parse.parse_qs(urllib.parse.urlsplit(headers['location']).query)['state'][0]
+        cookie=headers['set-cookie'].split(';')[0]
+        self.assertEqual(self.auth_request('/auth/callback?state='+state+'&code=unverified',cookie)[0],403)
+
+
+if __name__=='__main__':unittest.main()

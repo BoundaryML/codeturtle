@@ -1,0 +1,4 @@
+[toolchain]
+version = "0.20.2-nightly.20261004.a"
+[package]
+name = "codeturtle_service"

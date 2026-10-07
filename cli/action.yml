@@ -1,0 +1,44 @@
+name: CodeTurtle
+description: Install CodeTurtle and evaluate/report the trusted PR policy
+inputs:
+  api-url:
+    description: CodeTurtle HTTPS service origin
+    required: true
+  runtime-url:
+    description: Immutable URL for the BAML 0.20.2-nightly.20261004.a Linux runtime binary or archive
+    required: true
+  runtime-sha256:
+    description: SHA-256 of the pinned BAML runtime binary or archive
+    required: true
+outputs:
+  report-path:
+    description: Local evaluation output, retained even if upload fails
+    value: ${{ steps.review.outputs.report-path }}
+runs:
+  using: composite
+  steps:
+    - name: Install pinned runtime and CLI
+      shell: bash
+      env:
+        ACTION_ROOT: ${{ github.action_path }}
+        RUNTIME_URL: ${{ inputs.runtime-url }}
+        RUNTIME_SHA256: ${{ inputs.runtime-sha256 }}
+      run: |
+        set -euo pipefail
+        install_dir="$RUNNER_TEMP/codeturtle"
+        python3 -m venv "$install_dir/venv"
+        "$install_dir/venv/bin/python" "$ACTION_ROOT/scripts/install_runtime.py" --url "$RUNTIME_URL" --sha256 "$RUNTIME_SHA256" --destination "$install_dir/bin/baml"
+        "$install_dir/bin/baml" --version | grep -F '0.20.2-nightly.20261004.a'
+        "$install_dir/venv/bin/python" -m pip install --disable-pip-version-check "$ACTION_ROOT"
+        echo "$install_dir/bin" >> "$GITHUB_PATH"
+        echo "$install_dir/venv/bin" >> "$GITHUB_PATH"
+    - name: Evaluate and report
+      id: review
+      shell: bash
+      env:
+        CODETURTLE_API_URL: ${{ inputs.api-url }}
+      run: |
+        set -euo pipefail
+        report_path="$RUNNER_TEMP/codeturtle-report.json"
+        echo "report-path=$report_path" >> "$GITHUB_OUTPUT"
+        codeturtle check --report --mode json | tee "$report_path"

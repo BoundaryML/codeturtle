@@ -1,0 +1,26 @@
+# Boundary staging.
+app = "boundary-codeturtle-staging"
+primary_region = "ord"
+kill_signal = "SIGTERM"
+kill_timeout = "30s"
+[build]
+  dockerfile = "backend/Dockerfile"
+[build.args]
+  BAML_RUNTIME_URL = "https://github.com/BoundaryML/baml/releases/download/baml-language-0.20.2-nightly.20261004.a/baml-language-0.20.2-nightly.20261004.a-x86_64-unknown-linux-musl.tar.gz"
+  BAML_RUNTIME_SHA256 = "f04ac48a55c52a97c3b8ace0db0d0da351d85ab6f9bb14e79ebab817a7b5777c"
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+  [[http_service.checks]]
+    grace_period = "20s"
+    interval = "30s"
+    timeout = "5s"
+    method = "GET"
+    path = "/readyz"
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "512mb"
