@@ -1,5 +1,7 @@
 # CodeTurtle
 
+Slow down! Read code.
+
 CodeTurtle evaluates repository policies locally and publishes authenticated CI reports through a BAML service.
 
 ```text
