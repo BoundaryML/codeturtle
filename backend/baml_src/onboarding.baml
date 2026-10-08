@@ -49,8 +49,9 @@ class Onboarding {
             409,
             "workflow_already_exists_verify_setup",
         );
-        if (!paths.includes(".github/codeturtle/OWNERS")) {
-            files[".github/codeturtle/OWNERS"] = "* " + owners.join(" ") + "\n";
+        if (!paths.includes("CODETURTLE.md") && !paths.includes(".github/codeturtle/OWNERS")) {
+            files["CODETURTLE.md"]
+                = "# CodeTurtle review rules\n\n```codeturtle\n* " + owners.join(" ") + "\n```\n";
         }
         files
     }
@@ -330,8 +331,23 @@ function start_setup(
 ) -> baml.http.Response {
     let session = auth.session(req);
     let q = query(req.url);
-    let installation = q.get("installation_id") ?? "";
-    let repository = q.get("repository_id") ?? "";
+    let review_id = q.get("run");
+    let target = if (review_id != null) {
+        require(matches(review_id, "^[a-f0-9-]{36}$"), 400, "invalid_run");
+        auth.store.rpc("review_link_target", { "id": review_id, "actor": field(session, "actor") })
+    } else {
+        null
+    };
+    let installation = if (target != null) {
+        str(target, "installation_id")
+    } else {
+        q.get("installation_id") ?? ""
+    };
+    let repository = if (target != null) {
+        str(target, "repository_id")
+    } else {
+        q.get("repository_id") ?? ""
+    };
     require(
         matches(installation, "^[1-9][0-9]*$") && matches(repository, "^[1-9][0-9]*$"),
         400,
@@ -347,6 +363,8 @@ function start_setup(
                 "actor": field(session, "actor"),
                 "installation_id": installation,
                 "repository_id": repository,
+                "review_id": review_id,
+                "next": safe_return(q.get("next") ?? "/"),
             },
             "expires_at": now() + 600,
         },
@@ -410,6 +428,25 @@ function complete_setup(
             break;
         }
         page += 1;
+    }
+    if (field(data, "review_id") != null) {
+        require(
+            selected != null && field(field(selected, "permissions"), "pull") == true,
+            403,
+            "repository_access_required",
+        );
+        let actor = baml.json.to<Actor>(field(session, "actor"));
+        let _ = auth.store.rpc(
+            "link_reviewer",
+            {
+                "actor": baml.json.from(actor),
+                "repository_id": repository_id,
+                "installation_id": installation_id,
+                "github_user_id": num(user, "id").to_string(),
+                "encrypted_token": secrets.seal(token, "github-user:" + actor.user_id + ":" + repository_id),
+            },
+        );
+        return redirect(safe_return(baml.json.to<string?>(field(data, "next")) ?? "/"));
     }
     require(
         selected != null && field(field(selected, "permissions"), "admin") == true,

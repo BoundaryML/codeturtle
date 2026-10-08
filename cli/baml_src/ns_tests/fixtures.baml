@@ -1,6 +1,8 @@
 // Shared real fixture data. Each call reads fresh values; tests never write the fixture.
 function fixture_dir() -> string {
-    if (baml.fs.exists("fixture/changes.json")) { return "fixture"; }
+    if (baml.fs.exists("fixture/changes.json")) {
+        return "fixture";
+    }
     throw "Run baml test from the CodeTurtle project root";
 }
 

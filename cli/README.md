@@ -12,11 +12,28 @@ whole PR. It can be ordinary code, an AI/JEV function, or code that combines bot
 /src/ @release-team # codeturtle: when=checks.pr.docs_only_source_change
 ```
 
-Put these rules in `.github/codeturtle/OWNERS`, and put your BAML files anywhere
-beneath `.github/codeturtle/`. CodeTurtle compiles the directory with
-`reflect.Package.compile()`, looks up the named function, and uses its signature
-to decide what to pass and how often to call it. No registration file, scope flag,
-or generated SDK is needed.
+Put rules in a fenced `codeturtle` block in **`CODETURTLE.md` at the repository root**:
+
+````markdown
+# Review policy
+
+```codeturtle
+* @alice
+/frontend/ @bob
+/backend/ @alice @carol # codeturtle: all
+```
+````
+
+Prose outside the fence is documentation. Multiple `codeturtle` fences are additive;
+line numbers refer to the Markdown file. `*`, exact rooted paths, and directory
+prefixes use the existing rule evaluator. Put conditional BAML functions beneath
+`.github/codeturtle/` and reference them with `# codeturtle: when=checks.function`.
+`CODETURTLE.md` takes precedence over the legacy `.github/codeturtle/OWNERS` file;
+an invalid Markdown policy fails rather than falling back. The CI runner always
+loads the policy from the trusted base revision, never from PR code.
+
+CodeTurtle compiles BAML extensions with `reflect.Package.compile()` and uses each
+function's signature to decide what to pass. No generated SDK is needed.
 
 The local runner evaluates real Git revisions and returns typed review
 requirements, reasons, evidence, and errors. It does not collect human approvals.
@@ -389,7 +406,8 @@ need Git, Python 3, the installed BAML toolchain and standard POSIX utilities.
 
 Direct AI/JEV functions work today. Natural-language shorthand such as
 `when="changes the public API"` is not supported; use a named BAML function.
-Inline fences and human decision storage remain future work.
+Inline BAML function definitions in Markdown remain unsupported. Rule fences
+are supported; reviewer sign-offs are stored by the connected service.
 Connected reporting is provided by the sibling BAML backend. Full CODEOWNERS glob matching is also pending.
 The Git adapter currently expects ordinary file blobs; submodule changes are
 reported as input errors. Policy source files must be regular files.

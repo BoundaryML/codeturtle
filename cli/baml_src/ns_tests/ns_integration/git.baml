@@ -310,3 +310,23 @@ function git_parallel_case() -> bool {
 test "parallel Git subprocesses are bounded and match sequential results" {
     assert.is_true(git_parallel_case());
 }
+
+function markdown_policy_case() -> bool {
+    with_git((dir, unused) -> {
+        write(dir, "CODETURTLE.md", "# Review rules\n\n```codeturtle\n* @markdown-reviewer\n```\n");
+        let base = commit(dir, "Add root Markdown policy");
+        change_code(dir);
+        write(dir, "CODETURTLE.md", "```codeturtle\n* @attacker\n```\n");
+        let head = commit(dir, "Change code and attempt to weaken policy");
+        let payload = git_check(dir, ["--base", base, "--head", head]);
+        assert.equal(payload.errors, []);
+        assert.is_true(root.tests.requirements(payload, "@markdown-reviewer").length() > 0);
+        assert.equal(root.tests.requirements(payload, "@attacker"), []);
+        assert.equal(root.tests.requirements(payload, "@repo-maintainers"), []);
+        true
+    })
+}
+
+test "Root CODETURTLE.md takes precedence and always comes from the trusted base" {
+    assert.is_true(markdown_policy_case())
+}

@@ -40,6 +40,10 @@ class ServiceTests(unittest.TestCase):
         cls.sql('CREATE DATABASE '+cls.db,database='postgres')
         sql=Path(sql_path).read_text();sql=sql.split('```sql\n')[1].split('```')[0] if '```sql' in sql else sql
         cls.sql(sql);cls.sql(sql) # setup is rerunnable
+        review_sql_path=os.environ.get('CODETURTLE_TEST_REVIEW_SQL')
+        if not review_sql_path: raise RuntimeError('Set CODETURTLE_TEST_REVIEW_SQL to the reviewer SQL update')
+        update=Path(review_sql_path).read_text().split('```sql\n')[1].split('```')[0]
+        cls.sql(update);cls.sql(update)
         cls.key=rsa.generate_private_key(public_exponent=65537,key_size=2048)
         cls.pem=cls.key.private_bytes(serialization.Encoding.PEM,serialization.PrivateFormat.PKCS8,serialization.NoEncryption()).decode()
         cls.jwk=json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(cls.key.public_key()));cls.jwk['kid']='test'
@@ -87,7 +91,7 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
  let app = ReportService {store: SupabaseStore {url: fixture_url, key: "fixture"}, github: GitHubClient {http: http, crypto: crypto, app_id: "test", private_key: baml.fs.read(key_path), bot_id: 999}, oidc: GitHubOIDC {http: http, crypto: crypto, audience: origin}, parser: report_parser(models_path), origin: origin, slack: SlackClient {http: http, secrets: SecretBox {key: uint8array.zeroes(32)}}, browser: BrowserAuth {store: SupabaseStore {url: fixture_url, key: "fixture"}, http: http, origin: origin, client_id: "test", client_secret: "test", secrets: SecretBox {key: uint8array.zeroes(32)}}, onboarding: null}; app.deliver_once()
 }'''
         (cls.project/'baml_src/fixture.baml').write_text(fixture)
-        cls.env=dict(os.environ,BAML_VERSION='0.20.2-nightly.20261004.a')
+        cls.env=dict(os.environ,BAML_VERSION='0.20.2-nightly.20261004.a',CODETURTLE_GITHUB_CLIENT_ID='test',CODETURTLE_GITHUB_CLIENT_SECRET='test')
         cls.args=['--fixture_url',cls.mock_url,'--python',str(ROOT/'backend/.venv/bin/python'),'--crypto_path',str(ROOT/'backend/crypto.py'),'--models_path',str(ROOT/'cli/baml_src/models.baml'),'--key_path',str(cls.path/'key.pem'),'--origin',cls.origin]
         cls.log=open(cls.path/'service.log','w+');cls.addClassCleanup(cls.log.close)
         cls.start_service();cls.addClassCleanup(cls.stop_service)
@@ -129,6 +133,10 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
         url=data['url'];method=data['method']
         if url == 'https://api.workos.com/user_management/authenticate':
             return {'user':{'id':'workos-user','email_verified':data['payload']['code']!='unverified'},'organization_id':'tenant'}
+        if url == 'https://api.github.com/user':return {'id':1,'login':'one'}
+        if url == 'https://github.com/login/oauth/access_token':return {'access_token':'reader'}
+        if '/user/installations/' in url:return {'repositories':[{'id':42,'full_name':'acme/repo','permissions':{'admin':False,'pull':True},'default_branch':'main'}]}
+        if '/compare/' in url and '?' in url:return {'files':[{'filename':'a.txt','patch':'@@ -1 +1 @@\n-before\n+after'}]}
         if url.endswith('/.well-known/jwks'):return {'keys':[cls.jwk]}
         if url.endswith('/access_tokens'):return {'token':'installation'}
         if url.endswith('/repos/acme/repo'):return {'id':42,'permissions':{'admin':True,'pull':True},'default_branch':'main'}
@@ -255,7 +263,7 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
         self.sql("INSERT INTO codeturtle_private.memberships VALUES('user','tenant','42','1',true,'"+sealed+"')")
         cookie={'Cookie':'__Host-ct_session='+token}
         self.assertEqual(self.request('/api/review?run='+g['run_id'])[0],401)
-        status,view=self.request('/api/review?run='+g['run_id'],headers=cookie);self.assertEqual(status,200,view);self.assertEqual(view['identity'],self.identity)
+        status,view=self.request('/api/review?run='+g['run_id'],headers=cookie);self.assertEqual(status,200,view);self.assertEqual(view['review']['identity'],self.identity)
         self.assertNotIn('encrypted_token',json.dumps(view))
         status,_=self.request('/api/slack/mapping',body={'repository_id':'42','owner':'@one','user_id':'U123','channel':'C123'},headers=cookie)
         self.assertEqual(status,403)
@@ -301,6 +309,109 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
         state=urllib.parse.parse_qs(urllib.parse.urlsplit(headers['location']).query)['state'][0]
         cookie=headers['set-cookie'].split(';')[0]
         self.assertEqual(self.auth_request('/auth/callback?state='+state+'&code=unverified',cookie)[0],403)
+
+    def reviewer_session(self, user='reviewer', github_id='1', tenant='tenant'):
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCMSIV
+        import hashlib
+        token=hashlib.sha256((user+uuid.uuid4().hex).encode()).hexdigest()
+        actor={'user_id':user,'tenant_id':tenant}
+        self.rpc('ct_session_put',{'token_hash':hashlib.sha256(token.encode()).hexdigest(),'actor':actor,'csrf':'csrf','expires_at':int(time.time())+3600})
+        sealed='00'*12+':'+AESGCMSIV(bytes(32)).encrypt(bytes(12),b'github-user-token',('github-user:'+user+':42').encode()).hex()
+        self.sql("INSERT INTO codeturtle_private.memberships VALUES('"+user+"','"+tenant+"','42','"+github_id+"',false,'"+sealed+"')")
+        return {'Cookie':'__Host-ct_session='+token,'Origin':self.origin,'X-CSRF-Token':'csrf'},actor
+
+    def review_fixture(self):
+        g=self.register();e=self.envelope(g)
+        requirement={'path':'a.txt','owners':['@one','@two'],'approval':'All','evaluation':{'rule_line':1,'condition':None,'result':{'path':'a.txt','verdict':'Applies','reason':'Changed file','evidence':[]}}}
+        e['report']['requirements']=[requirement]
+        self.assertEqual(self.upload(g,e)[0],202)
+        headers,actor=self.reviewer_session()
+        body={'run_id':g['run_id'],'head':self.head,'indices':[0],'reviewed':True}
+        return g,headers,actor,body
+
+    def test_personal_review_signoff_and_comment_update(self):
+        g,headers,actor,body=self.review_fixture()
+        self.delivery();self.assertIn('| Reviewer | Parts | Progress | Review |',self.comments[0]['body'])
+        self.assertIn('reviewer=%40one',self.comments[0]['body'])
+        status,page=self.request('/api/review?run='+g['run_id'],headers=headers)
+        self.assertEqual(status,200,page);self.assertEqual(page['reviewer']['login'],'one')
+        self.assertEqual(self.request('/api/review/decision',body=body,headers=headers)[0],200)
+        self.assertEqual(self.request('/api/review/decision',body=body,headers=headers)[0],200)
+        self.assertEqual(self.sql('SELECT count(*) FROM codeturtle_private.review_decisions'),'1')
+        self.delivery();self.assertEqual(self.posts,1);self.assertIn('1/1 reviewed',self.comments[0]['body'])
+        _,page=self.request('/api/review?run='+g['run_id'],headers=headers)
+        self.assertEqual(page['completed_requirements'],0) # All still needs @two
+        self.stop_service();self.start_service()
+        self.assertEqual(self.sql('SELECT count(*) FROM codeturtle_private.review_decisions'),'1')
+        body['reviewed']=False
+        self.assertEqual(self.request('/api/review/decision',body=body,headers=headers)[0],200)
+        self.assertEqual(self.sql('SELECT count(*) FROM codeturtle_private.review_decisions'),'0')
+
+    def test_review_mutation_requires_identity_csrf_current_revision(self):
+        g,headers,actor,body=self.review_fixture()
+        self.assertEqual(self.request('/api/review/decision',body=body)[0],401)
+        self.assertEqual(self.request('/api/review/decision',body=body,headers={'Cookie':headers['Cookie']})[0],403)
+        self.assertEqual(self.request('/api/review/decision',body=dict(body,head='f'*40),headers=headers)[0],409)
+        self.assertEqual(self.request('/api/review/decision',body=dict(body,indices=[0,99]),headers=headers)[0],400)
+        self.assertEqual(self.sql('SELECT count(*) FROM codeturtle_private.review_decisions'),'0')
+        other,_=self.reviewer_session('other','2')
+        self.assertEqual(self.request('/api/review/decision',body=body,headers=other)[0],403)
+        alien,_=self.reviewer_session('alien','1','different-tenant')
+        self.assertEqual(self.request('/api/review/decision',body=body,headers=alien)[0],403)
+        type(self).live_head='f'*40
+        self.assertEqual(self.request('/api/review/decision',body=body,headers=headers)[0],409)
+        type(self).live_head=self.head
+        self.sql('UPDATE codeturtle_private.runs SET superseded=true')
+        self.assertEqual(self.request('/api/review/decision',body=body,headers=headers)[0],409)
+
+    def test_signoff_during_comment_delivery_is_not_lost(self):
+        g,headers,actor,body=self.review_fixture()
+        lease=self.rpc('ct_lease',{})
+        self.assertEqual(self.request('/api/review/decision',body=body,headers=headers)[0],200)
+        self.assertIsNone(self.rpc('ct_lease',{}))
+        self.rpc('ct_delivery_done',{'id':g['run_id'],'destination':'github','lease':lease['lease'],'reference':{'id':1}})
+        self.assertIsNotNone(self.rpc('ct_lease',{}))
+
+    def test_unassigned_reviewer_cannot_mark_parts(self):
+        g,headers,actor,body=self.review_fixture()
+        self.sql("UPDATE codeturtle_private.runs SET envelope=jsonb_set(envelope,'{report,requirements,0,owners}','[\"@two\"]')")
+        self.assertEqual(self.request('/api/review/decision',body=body,headers=headers)[0],403)
+
+    def test_reviewer_link_cannot_rebind_installation(self):
+        g=self.register();self.upload(g,self.envelope(g))
+        p={'actor':{'user_id':'new','tenant_id':'tenant'},'repository_id':'42','installation_id':'9','github_user_id':'7','encrypted_token':'cipher'}
+        self.assertEqual(self.rpc('ct_link_reviewer',dict(p,installation_id='10'))['status'],403)
+        self.assertEqual(self.rpc('ct_link_reviewer',dict(p,actor={'user_id':'new','tenant_id':'other'}))['status'],403)
+        self.assertEqual(self.rpc('ct_link_reviewer',p),{})
+        self.assertEqual(self.sql("SELECT can_setup FROM codeturtle_private.memberships WHERE user_id='new'"),'f')
+        for role in ['anon','authenticated']:
+            with self.assertRaises(subprocess.CalledProcessError):self.sql('SET ROLE '+role+"; SELECT public.ct_review_decisions('{}');")
+
+    def test_read_only_reviewer_oauth_and_immutable_diff(self):
+        import urllib.parse
+        g,headers,actor,body=self.review_fixture()
+        self.sql("DELETE FROM codeturtle_private.memberships WHERE user_id='reviewer'")
+        destination='/?run='+g['run_id']+'&reviewer=%40one'
+        start='/auth/github/start?run='+g['run_id']+'&next='+urllib.parse.quote(destination,safe='')
+        status,oauth,_=self.auth_request(start,headers['Cookie']);self.assertEqual(status,302)
+        state=urllib.parse.parse_qs(urllib.parse.urlsplit(oauth['location']).query)['state'][0]
+        cookies=headers['Cookie']+'; '+oauth['set-cookie'].split(';')[0]
+        callback='/auth/github/callback?state='+state+'&code=reader'
+        status,result,raw=self.auth_request(callback,cookies);self.assertEqual(status,302,raw)
+        self.assertEqual(result['location'],destination)
+        self.assertEqual(self.sql("SELECT can_setup FROM codeturtle_private.memberships WHERE user_id='reviewer'"),'f')
+        self.assertEqual(self.auth_request(callback,cookies)[0],403)
+        status,data=self.request('/api/review/diff?run='+g['run_id']+'&index=0',headers=headers)
+        self.assertEqual(status,200,data);self.assertIn('+after',data['patch'])
+
+    def test_workos_preserves_personal_review_link(self):
+        import urllib.parse
+        target='/?run=00000000-0000-0000-0000-000000000001&reviewer=%40one'
+        _,headers,_=self.auth_request('/auth/login?next='+urllib.parse.quote(target,safe=''))
+        state=urllib.parse.parse_qs(urllib.parse.urlsplit(headers['location']).query)['state'][0]
+        cookie=headers['set-cookie'].split(';')[0]
+        status,headers,_=self.auth_request('/auth/callback?state='+state+'&code=valid',cookie)
+        self.assertEqual(status,302);self.assertEqual(headers['location'],target)
 
 
 if __name__=='__main__':unittest.main()

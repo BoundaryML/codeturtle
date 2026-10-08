@@ -126,7 +126,7 @@ def changes(repo, merge_base, head, concurrency=8):
 def write_snapshot(repo, base, destination, concurrency=8):
     target = destination / POLICY_PATH
     target.mkdir(parents=True)
-    entries = git(repo, "ls-tree", "-r", "-z", "--full-tree", base, "--", POLICY_PATH).split(b"\0")
+    entries = git(repo, "ls-tree", "-r", "-z", "--full-tree", base, "--", POLICY_PATH, "CODETURTLE.md").split(b"\0")
     files = []
     for entry in entries:
         if not entry:
@@ -134,9 +134,9 @@ def write_snapshot(repo, base, destination, concurrency=8):
         metadata, raw_path = entry.split(b"\t", 1)
         mode, kind, object_id = metadata.split()
         path = PurePosixPath(decode_path(raw_path))
-        if path.name != "OWNERS" and path.suffix != ".baml":
+        if str(path) != "CODETURTLE.md" and path.name != "OWNERS" and path.suffix != ".baml":
             continue
-        if path.is_absolute() or ".." in path.parts or path.parts[:2] != (".github", "codeturtle"):
+        if path.is_absolute() or ".." in path.parts or (str(path) != "CODETURTLE.md" and path.parts[:2] != (".github", "codeturtle")):
             raise InputError("Invalid policy path in Git snapshot")
         if kind != b"blob" or mode not in (b"100644", b"100755"):
             raise InputError("Policy files must be regular files: " + str(path))
@@ -147,15 +147,21 @@ def write_snapshot(repo, base, destination, concurrency=8):
             local = destination.joinpath(*path.parts)
             local.parent.mkdir(parents=True, exist_ok=True)
             local.write_bytes(content)
-    if not (target / "OWNERS").is_file():
+    if not (destination / "CODETURTLE.md").is_file() and not (target / "OWNERS").is_file():
         raise InputError(
-            "No .github/codeturtle/OWNERS at base revision " + base
+            "No CODETURTLE.md or .github/codeturtle/OWNERS at base revision " + base
             + ". For a local preview, explicitly pass --policy-dir <directory>."
         )
 
 
 def write_local_policy(source, destination):
     source = source.resolve()
+    markdown = source / "CODETURTLE.md"
+    if markdown.is_symlink():
+        raise InputError("Policy files must be regular files: CODETURTLE.md")
+    if markdown.is_file():
+        shutil.copyfile(markdown, destination / "CODETURTLE.md")
+        source = source / POLICY_PATH
     target = destination / POLICY_PATH
     target.mkdir(parents=True)
     for path in sorted(source.rglob("*")):
@@ -165,16 +171,21 @@ def write_local_policy(source, destination):
             local = target / path.relative_to(source)
             local.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(path, local)
-    if not (target / "OWNERS").is_file():
+    if not (destination / "CODETURTLE.md").is_file() and not (target / "OWNERS").is_file():
         raise InputError("The local policy directory must contain OWNERS")
 
 
 def run_baml(arguments, target=None):
+    # The wrapper chooses its toolchain before interpreting --project. Pin it
+    # explicitly so callers can run the installed CLI from any repository.
+    version = re.search(r'(?m)^version\s*=\s*"([^"\n]+)"', (ROOT / "baml.toml").read_text()).group(1)
+    environment = {k: v for k, v in os.environ.items() if not k.startswith(("ACTIONS_", "GITHUB_", "GH_", "CODETURTLE_"))}
+    environment['BAML_VERSION'] = version
     result = subprocess.run(
         ["baml", "--agent-skill-check", "off", "run", "--project", str(ROOT), "--output-format", "json",
          target or "main", "--", *arguments],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120,
-        env={k: v for k, v in os.environ.items() if not k.startswith(("ACTIONS_", "GITHUB_", "GH_", "CODETURTLE_"))},
+        env=environment,
     )
     if result.stderr:
         sys.stderr.write(result.stderr)
@@ -379,10 +390,10 @@ def lint(args):
             if args.policy_dir:
                 source = args.policy_dir
             else:
-                source = repo / POLICY_PATH
+                source = repo if (repo / "CODETURTLE.md").exists() else repo / POLICY_PATH
                 if not source.is_dir():
                     repo = Path(git(repo, "rev-parse", "--show-toplevel").decode().strip())
-                    source = repo / POLICY_PATH
+                    source = repo if (repo / "CODETURTLE.md").exists() else repo / POLICY_PATH
             write_local_policy(source, snapshot)
         return run_baml(["--repo", str(snapshot)], target="lint_policy")
 

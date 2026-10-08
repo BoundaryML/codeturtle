@@ -97,12 +97,17 @@ class GitHubClient {
     function check_current(self, run: AuthorizedRun) -> void {
         let _ = self.current_pr(run.identity, self.installation_token(run.enrollment));
     }
-    function upsert_pr_comment(self, run: StoredRun, origin: string) -> CommentRef {
+    function upsert_pr_comment(
+        self,
+        run: StoredRun,
+        origin: string,
+        decisions: ReviewDecision[] = [],
+    ) -> CommentRef {
         let i = run.authorized.identity;
         let token = self.installation_token(run.authorized.enrollment, write = true);
         let _ = self.current_pr(i, token);
         let marker = `<!-- codeturtle:${i.repository_id}:${i.pr} -->`;
-        let body = github_report(run, origin) + "\n" + marker;
+        let body = github_report(run, origin, decisions = decisions) + "\n" + marker;
         // Reconcile before creation, including after a lost provider response.
         let page = 1;
         while (page <= 100) {
@@ -148,13 +153,17 @@ function safe_markdown(s: string) -> string {
         .replace_all(">", "&gt;")
         .replace_all("@", "＠")
         .replace_all("`", "\\`")
+        .replace_all("|", "&#124;")
+        .replace_all("[", "&#91;")
+        .replace_all("]", "&#93;")
+        .replace_all("\r", " ")
         .replace_all("\n", " ")
 }
 
-function github_report(run: StoredRun, origin: string) -> string {
+function github_report(run: StoredRun, origin: string, decisions: ReviewDecision[] = []) -> string {
     let e = run.envelope ?? throw "No report";
     let i = run.authorized.identity;
-    let text = `## CodeTurtle evaluation\n\n[View report](${origin}/?run=${run.id}) · Head \`${i.head}\` · Policy \`${i.policy}\`\n\n`;
+    let text = `## CodeTurtle review\n\n[View report](${origin}/?run=${run.id}) · Head \`${i.head}\` · Policy \`${i.policy}\`\n\n`;
     if (e.setup_failure != null) {
         return text
             + "Evaluation setup failed. See the CI run for details. Human approval has not been determined.";
@@ -162,31 +171,48 @@ function github_report(run: StoredRun, origin: string) -> string {
     let complete = baml.json.to<bool>(field(e.report, "evaluation_complete"));
     text
         += if (complete) {
-            "Evaluation complete. Human approval has not been determined.\n\n"
+            "Evaluation complete. Reviewer sign-offs are tracked below.\n\n"
         } else {
             "Evaluation incomplete; errors or ownership gaps require attention.\n\n"
         };
-    for (let r in baml.json.to<json[]>(field(e.report, "requirements"))) {
-        let reason = str(field(field(r, "evaluation"), "result"), "reason");
-        let line = "- "
-            + safe_markdown(str(r, "path"))
-            + ": **"
-            + str(r, "approval")
-            + "** "
-            + baml.json.to<string[]>(field(r, "owners"))
-                .map((o) -> {
-                    safe_markdown(o)
+    let requirements = review_requirements(e.report);
+    let reviewed = 0;
+    let index = 0;
+    for (let r in requirements) {
+        if (requirement_reviewed(r, index, decisions)) {
+            reviewed += 1;
+        }
+        index += 1;
+    }
+    text
+        += reviewed.to_string()
+            + "/"
+            + requirements.length().to_string()
+            + " review requirements satisfied (respecting Any/All rules).\n\n";
+    text += "| Reviewer | Parts | Progress | Review |\n| --- | --- | --- | --- |\n";
+    for (let row in reviewer_rows(e.report, decisions, origin, run.id)) {
+        let line = "| "
+            + safe_markdown(row.owner)
+            + " | "
+            + row.parts
+                .map((p) -> {
+                    safe_markdown(p)
                 })
                 .join(", ")
-            + " — "
-            + safe_markdown(reason)
-            + "\n";
+            + " | "
+            + row.completed.to_string()
+            + "/"
+            + row.indices.length().to_string()
+            + " reviewed | [Open assigned review]("
+            + row.url
+            + ") |\n";
         if (text.length() + line.length() > 50000) {
-            text += "\nAdditional requirements in the report.\n";
+            text += "\nAdditional assignments in the report.\n";
             break;
         }
         text += line;
     }
+    text += "\nSign-offs apply only to this report and commit. New pushes require a fresh review.\n";
     text
 }
 

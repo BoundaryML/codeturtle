@@ -34,9 +34,17 @@ python3 -m unittest discover -s cli -p test_reporting.py -v
 baml --agent-skill-check off test --directory backend
 backend/.venv/bin/python -m unittest discover -s backend/tests -p test_crypto.py -v
 CODETURTLE_TEST_SQL=/absolute/path/to/operator-handoff.md \
+CODETURTLE_TEST_REVIEW_SQL=/absolute/path/to/codeturtle-review-signoffs.md \
   backend/.venv/bin/python -m unittest discover -s backend/tests -p test_service.py -v
 npm --prefix frontend run build
 ```
 
 The service integration tests use a disposable local PostgreSQL cluster and mocked providers.
 Secrets belong in the ignored `backend/.env` or deployment secret store.
+
+Create `CODETURTLE.md` at the reviewed repository root; see the [policy syntax](cli/README.md).
+The PR comment groups requirements by reviewer and links to personal review pages.
+Reviewers sign in with WorkOS, link their own GitHub identity, inspect diffs and mark
+assigned parts reviewed. Decisions are tied to an immutable report/revision and
+respect Any/All rules. A new run starts a fresh review. These are CodeTurtle sign-offs;
+they do not submit GitHub approvals or change branch protection.

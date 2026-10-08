@@ -127,11 +127,17 @@ class BrowserAuth {
     client_id: string,
     client_secret: string,
     secrets: SecretBox,
-    function login(self) -> baml.http.Response {
+    function login(self, req: baml.http.ServerRequest) -> baml.http.Response {
         let state = secret();
+        let next = safe_return(query(req.url).get("next") ?? "/");
         let _ = self.store.rpc(
             "oauth_put",
-            { "hash": sha256(state), "purpose": "workos", "data": {}, "expires_at": now() + 600 },
+            {
+                "hash": sha256(state),
+                "purpose": "workos",
+                "data": { "next": next },
+                "expires_at": now() + 600,
+            },
         );
         redirect(
             "https://api.workos.com/user_management/authorize?provider=authkit&response_type=code&client_id="
@@ -151,7 +157,7 @@ class BrowserAuth {
             403,
             "invalid_login_state",
         );
-        let _ = self.store.rpc("oauth_take", { "hash": sha256(state), "purpose": "workos" });
+        let login_data = self.store.rpc("oauth_take", { "hash": sha256(state), "purpose": "workos" });
         let result = self.http.send(
             "POST",
             "https://api.workos.com/user_management/authenticate",
@@ -177,7 +183,7 @@ class BrowserAuth {
             },
         );
         redirect(
-            "/",
+            safe_return(baml.json.to<string?>(field(login_data, "next")) ?? "/"),
             set_cookie = "__Host-ct_session=" + token + "; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=3600",
         )
     }
@@ -297,4 +303,20 @@ function redirect(location: string, set_cookie: string = "") -> baml.http.Respon
 test "URL roundtrip and cookie parsing" {
     assert.equal(url_decode(url_encode("a /?&=%é")), "a /?&=%é");
     assert.equal(query("/?code=a%3Db&state=42").get("code"), "a=b")
+}
+
+function safe_return(path: string) -> string {
+    if (
+        path == "/"
+            || (
+                path.starts_with("/?")
+                    && !path.includes("\n")
+                    && !path.includes("\r")
+                    && !path.includes("\\")
+            )
+    ) {
+        path
+    } else {
+        "/"
+    }
 }

@@ -210,3 +210,11 @@ function setup_output_case() -> bool {
 test "setup errors respect the requested output format" {
     assert.is_true(setup_output_case());
 }
+
+test "Installed CLI pins its own runtime regardless of caller toolchain" {
+    with_temp((dir) -> {
+        let result = cli(["help", "--mode", "json"], cwd = dir, env = { "BAML_VERSION": "does-not-exist" });
+        expect_exit(result, 0);
+        assert.contains(result.stdout.to_string(), "codeturtle.FileChange")
+    })
+}

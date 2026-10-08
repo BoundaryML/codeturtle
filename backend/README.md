@@ -103,6 +103,7 @@ python3 -m unittest discover -s cli -p test_reporting.py -v
 baml --agent-skill-check off test --directory backend
 backend/.venv/bin/python -m unittest discover -s backend/tests -p test_crypto.py -v
 CODETURTLE_TEST_SQL=/absolute/path/to/operator-handoff.md \
+CODETURTLE_TEST_REVIEW_SQL=/absolute/path/to/codeturtle-review-signoffs.md \
   backend/.venv/bin/python -m unittest discover -s backend/tests -p test_service.py -v
 npm --prefix frontend run typecheck
 npm --prefix frontend run build
@@ -121,11 +122,32 @@ configuration before deploying; keep secrets in Fly. The image runs as a nonroot
 user, and Fly configuration keeps one machine running. Deployment, remote creation,
 release publication, hosted database setup, real App/OAuth callbacks and live
 messages require the corresponding accounts/authorization and staging validation.
-Human-approval writes and enforcement remain unimplemented pending that product
-choice. Container execution, provider rate-limit behavior and backup/restore/key
+CodeTurtle reviewer sign-offs require the separate additive reviewer SQL handoff
+before deploying this version. GitHub approval submission and merge enforcement
+are not implemented. Container execution, provider rate-limit behavior and backup/restore/key
 rotation must be exercised in the chosen hosting environment before rollout.
 
 Provider API references: [GitHub OIDC](https://docs.github.com/en/actions/reference/security/oidc),
 [GitHub App authentication](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation),
 [Slack OAuth](https://docs.slack.dev/authentication/installing-with-oauth/),
 [WorkOS authentication](https://workos.com/docs/reference/authkit/authentication).
+
+### Personal reviews
+
+Apply `codeturtle-review-signoffs.md` from the operator handoff before deployment.
+It adds private reviewer decisions, read-only reviewer linking, and outbox revision
+tracking so concurrent sign-offs cannot lose comment updates. No startup migration runs.
+
+Personal links preserve their destination through WorkOS and GitHub login. Repository
+readers can link themselves to an existing enrollment without receiving setup/admin
+rights. Mark/reopen actions require a current session, CSRF, live repository access,
+verified GitHub identity and a matching assigned owner. GitHub head/base revisions
+and database supersession are checked before every write. The URL's reviewer label
+is only a view filter, never an identity or permission.
+
+Individual `@login` rules work with the existing App permissions. Team rules use
+live GitHub team membership checks and need organization Members read permission;
+unverifiable membership never grants sign-off rights. Team rows represent a group
+owner; any verified member can satisfy that owner's slot. A reviewer can only remove
+their own decision. Diffs use immutable merge-base/head commits; binary/large or
+GitHub-truncated comparisons link back to the PR. No automatic GitHub review is submitted.

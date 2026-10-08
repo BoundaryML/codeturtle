@@ -74,7 +74,7 @@ class ReportService {
         }
         if let browser: BrowserAuth = self.browser {
             if (route == "/auth/login" && req.method == "GET") {
-                return browser.login();
+                return browser.login(req);
             }
             if (route == "/auth/callback" && req.method == "GET") {
                 return browser.complete_login(req);
@@ -120,10 +120,13 @@ class ReportService {
                 );
             }
             if (route == "/api/review" && req.method == "GET") {
-                let actor = field(browser.session(req), "actor");
-                let view = self.store.rpc("review", { "actor": actor, "id": query(req.url).get("run") ?? "" });
-                let _ = browser.authorize(req, str(field(view, "identity"), "repository_id"));
-                return response(200, view);
+                return response(200, review_page(browser, req, self.github));
+            }
+            if (route == "/api/review/diff" && req.method == "GET") {
+                return response(200, review_diff(browser, req, self.github));
+            }
+            if (route == "/api/review/decision" && req.method == "POST") {
+                return response(200, mark_review(browser, req, self.github));
             }
             if (route == "/api/slack/mapping" && req.method == "POST") {
                 let body = baml.json.parse(req.body);
@@ -228,7 +231,15 @@ class ReportService {
         let result = {
             self.github.check_current(run.authorized);
             if (destination == "github") {
-                baml.json.from(self.github.upsert_pr_comment(run, self.origin))
+                baml.json.from(
+                    self.github.upsert_pr_comment(
+                        run,
+                        self.origin,
+                        decisions = baml.json.to<ReviewDecision[]>(
+                            self.store.rpc("review_decisions", { "id": run.id }),
+                        ),
+                    ),
+                )
             } else {
                 baml.json.from(self.slack.publish_review_request(run, self.origin))
             }
