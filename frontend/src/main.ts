@@ -7,7 +7,7 @@ import 'monaco-editor/languages/definitions/markdown/register';
 import EditorWorker from 'monaco-editor/editor/editor.worker?worker';
 import '../node_modules/monaco-editor/esm/vs/base/browser/ui/codicons/codicon/codicon.css';
 import { files, reviewers, ownership, state, page, load, saveDrafts, publish, overrideBlock, loadContent, fileStatus, owns, busy, type ReviewFile, type Decision, type Comment, type Side } from './workspace';
-import { dashboard } from './dashboard';
+import { dashboard, SignInRequired } from './dashboard';
 import './style.css';
 
 (self as unknown as { MonacoEnvironment: { getWorker: () => Worker } }).MonacoEnvironment = { getWorker: () => new EditorWorker() };
@@ -229,4 +229,4 @@ async function start() {
  if(!files.length) { app.innerHTML=header()+'<main class="preview-page">No changed files are available in this report.</main>'; return; }
  await loadContent(selected()); render();
 }
-void start().catch(e=>{ app.replaceChildren();const p=document.createElement('p');p.textContent=e instanceof Error?e.message:String(e);app.append(p);const a=document.createElement('a');a.href='/';a.textContent='Back to repositories';app.append(a); });
+void start().catch(e=>{ if(e instanceof SignInRequired)return;app.replaceChildren();const p=document.createElement('p');p.textContent=e instanceof Error?e.message:String(e);app.append(p);const a=document.createElement('a');a.href='/';a.textContent='Back to repositories';app.append(a); });
