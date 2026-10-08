@@ -358,6 +358,7 @@ function service() -> ReportService {
         origin: origin,
         client_id: config("CODETURTLE_WORKOS_CLIENT_ID"),
         client_secret: config("CODETURTLE_WORKOS_API_KEY"),
+        organization_id: baml.env.get("CODETURTLE_WORKOS_ORGANIZATION_ID"),
         secrets: secrets,
     };
     ReportService {

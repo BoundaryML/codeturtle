@@ -83,12 +83,12 @@ class ServiceTests(unittest.TestCase):
         fixture='''class FixtureTransport { url: string, implements Transport { function send(self, method: string, url: string, token: string, payload: json) -> json { let r = baml.http.send(baml.http.Request.from_url(self.url + "/provider").set_method("POST").set_body(baml.json.stringify({"method": method, "url": url, "token": token, "payload": payload}))); require(r.status_code == 200, 503, "fixture_provider_unavailable"); baml.json.parse(r.text()) } } }
 function test_main(addr: string, fixture_url: string, python: string, crypto_path: string, models_path: string, key_path: string, origin: string) -> never {
  let http = FixtureTransport {url: fixture_url}; let crypto = CryptoHelper {python: python, path: crypto_path};
- let app = ReportService {store: SupabaseStore {url: fixture_url, key: "fixture"}, github: GitHubClient {http: http, crypto: crypto, app_id: "test", private_key: baml.fs.read(key_path), bot_id: 999}, oidc: GitHubOIDC {http: http, crypto: crypto, audience: origin}, parser: report_parser(models_path), origin: origin, slack: SlackClient {http: http, secrets: SecretBox {key: uint8array.zeroes(32)}}, browser: BrowserAuth {store: SupabaseStore {url: fixture_url, key: "fixture"}, http: http, origin: origin, client_id: "test", client_secret: "test", secrets: SecretBox {key: uint8array.zeroes(32)}}, onboarding: null};
+ let app = ReportService {store: SupabaseStore {url: fixture_url, key: "fixture"}, github: GitHubClient {http: http, crypto: crypto, app_id: "test", private_key: baml.fs.read(key_path), bot_id: 999}, oidc: GitHubOIDC {http: http, crypto: crypto, audience: origin}, parser: report_parser(models_path), origin: origin, slack: SlackClient {http: http, secrets: SecretBox {key: uint8array.zeroes(32)}}, browser: BrowserAuth {store: SupabaseStore {url: fixture_url, key: "fixture"}, http: http, origin: origin, client_id: "test", client_secret: "test", organization_id: "tenant", secrets: SecretBox {key: uint8array.zeroes(32)}}, onboarding: null};
  baml.http.Server.bind(addr).serve((req) -> {app.handle(req)}, max_body_size = 4194304)
 }
 function test_delivery(fixture_url: string, python: string, crypto_path: string, models_path: string, key_path: string, origin: string) -> void {
  let http = FixtureTransport {url: fixture_url}; let crypto = CryptoHelper {python: python, path: crypto_path};
- let app = ReportService {store: SupabaseStore {url: fixture_url, key: "fixture"}, github: GitHubClient {http: http, crypto: crypto, app_id: "test", private_key: baml.fs.read(key_path), bot_id: 999}, oidc: GitHubOIDC {http: http, crypto: crypto, audience: origin}, parser: report_parser(models_path), origin: origin, slack: SlackClient {http: http, secrets: SecretBox {key: uint8array.zeroes(32)}}, browser: BrowserAuth {store: SupabaseStore {url: fixture_url, key: "fixture"}, http: http, origin: origin, client_id: "test", client_secret: "test", secrets: SecretBox {key: uint8array.zeroes(32)}}, onboarding: null}; app.deliver_once()
+ let app = ReportService {store: SupabaseStore {url: fixture_url, key: "fixture"}, github: GitHubClient {http: http, crypto: crypto, app_id: "test", private_key: baml.fs.read(key_path), bot_id: 999}, oidc: GitHubOIDC {http: http, crypto: crypto, audience: origin}, parser: report_parser(models_path), origin: origin, slack: SlackClient {http: http, secrets: SecretBox {key: uint8array.zeroes(32)}}, browser: BrowserAuth {store: SupabaseStore {url: fixture_url, key: "fixture"}, http: http, origin: origin, client_id: "test", client_secret: "test", organization_id: "tenant", secrets: SecretBox {key: uint8array.zeroes(32)}}, onboarding: null}; app.deliver_once()
 }'''
         (cls.project/'baml_src/fixture.baml').write_text(fixture)
         cls.env=dict(os.environ,BAML_VERSION='0.20.2-nightly.20261004.a',CODETURTLE_FRONTEND_DIR=str(ROOT/'frontend/dist'),CODETURTLE_GITHUB_CLIENT_ID='test',CODETURTLE_GITHUB_CLIENT_SECRET='test')
@@ -132,7 +132,11 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
         if cls.provider_down:raise ValueError()
         url=data['url'];method=data['method']
         if url == 'https://api.workos.com/user_management/authenticate':
-            return {'user':{'id':'workos-user','email_verified':data['payload']['code']!='unverified'},'organization_id':'tenant'}
+            result = {'user':{'id':'workos-user','email_verified':data['payload']['code']!='unverified'},'organization_id':'tenant'}
+            if data['payload']['code']=='missing-org': result.pop('organization_id')
+            if data['payload']['code']=='null-org': result['organization_id']=None
+            if data['payload']['code']=='wrong-org': result['organization_id']='other-tenant'
+            return result
         if url == 'https://api.github.com/user':return {'id':1,'login':'one'}
         if url == 'https://github.com/login/oauth/access_token':return {'access_token':'reader'}
         if '/user/installations/' in url:return {'repositories':[{'id':42,'full_name':'acme/repo','permissions':{'admin':False,'pull':True},'default_branch':'main'}]}
@@ -302,6 +306,19 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
         self.assertEqual(status,200,session)
         self.assertEqual(len(session['csrf']),64)
         self.assertEqual(self.auth_request(callback,cookie)[0],403)
+
+    def test_workos_requires_organization_context(self):
+        import urllib.parse
+        for code in ['missing-org','null-org','wrong-org']:
+            with self.subTest(code=code):
+                _,headers,_=self.auth_request('/auth/login')
+                query=urllib.parse.parse_qs(urllib.parse.urlsplit(headers['location']).query)
+                self.assertEqual(query.get('organization_id'),['tenant'])
+                cookie=headers['set-cookie'].split(';')[0]
+                status,headers,body=self.auth_request('/auth/callback?state='+query['state'][0]+'&code='+code,cookie)
+                self.assertEqual(status,403)
+                self.assertEqual(json.loads(body)['error'],'organization_required' if code!='wrong-org' else 'organization_mismatch')
+                self.assertNotIn('set-cookie',headers)
 
     def test_workos_rejects_unverified_email(self):
         import urllib.parse

@@ -8,6 +8,8 @@ kill_timeout = "30s"
 [build.args]
   BAML_RUNTIME_URL = "https://github.com/BoundaryML/baml/releases/download/baml-language-0.20.2-nightly.20261004.a/baml-language-0.20.2-nightly.20261004.a-x86_64-unknown-linux-musl.tar.gz"
   BAML_RUNTIME_SHA256 = "f04ac48a55c52a97c3b8ace0db0d0da351d85ab6f9bb14e79ebab817a7b5777c"
+[env]
+  CODETURTLE_WORKOS_ORGANIZATION_ID = "org_01M4BZY7404YX3KCPGSW46QA24"
 [http_service]
   internal_port = 8080
   force_https = true

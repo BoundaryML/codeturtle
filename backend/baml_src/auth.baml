@@ -126,6 +126,7 @@ class BrowserAuth {
     origin: string,
     client_id: string,
     client_secret: string,
+    organization_id: string?,
     secrets: SecretBox,
     function login(self, req: baml.http.ServerRequest) -> baml.http.Response {
         let state = secret();
@@ -145,7 +146,14 @@ class BrowserAuth {
                 + "&redirect_uri="
                 + url_encode(self.origin + "/auth/callback")
                 + "&state="
-                + state,
+                + state
+                + (
+                    if let org: string = self.organization_id {
+                        "&organization_id=" + url_encode(org)
+                    } else {
+                        ""
+                    }
+                ),
             set_cookie = "__Host-ct_login=" + state + "; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=600",
         )
     }
@@ -171,7 +179,13 @@ class BrowserAuth {
         );
         let user = field(result, "user");
         require(field(user, "email_verified") == true, 403, "verified_identity_required");
-        let actor = Actor { user_id: str(user, "id"), tenant_id: str(result, "organization_id") };
+        //# A verified user must also have authenticated organization context.
+        let org = baml.json.to<string?>(field(result, "organization_id"));
+        require(org != null && org != "", 403, "organization_required");
+        if let expected: string = self.organization_id {
+            require(org == expected, 403, "organization_mismatch");
+        }
+        let actor = Actor { user_id: str(user, "id"), tenant_id: org ?? throw "Missing organization" };
         let token = secret();
         let _ = self.store.rpc(
             "session_put",

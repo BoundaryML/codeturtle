@@ -54,6 +54,7 @@ Set these **CodeTurtle-specific** environment variables:
 | `CODETURTLE_GITHUB_APP_ID`, `CODETURTLE_GITHUB_BOT_ID` | App and numeric bot user IDs |
 | `CODETURTLE_GITHUB_PRIVATE_KEY`, `CODETURTLE_GITHUB_WEBHOOK_SECRET` | App private key and signing secret |
 | `CODETURTLE_GITHUB_CLIENT_ID`, `CODETURTLE_GITHUB_CLIENT_SECRET` | App user OAuth credentials |
+| `CODETURTLE_WORKOS_ORGANIZATION_ID` | Optional organization to select during AuthKit login and require in the callback; set to Boundary for this staging deployment |
 | `CODETURTLE_WORKOS_CLIENT_ID`, `CODETURTLE_WORKOS_API_KEY` | AuthKit organization login credentials |
 | `CODETURTLE_SLACK_CLIENT_ID`, `CODETURTLE_SLACK_CLIENT_SECRET` | Optional Slack App OAuth credentials |
 | `CODETURTLE_ENCRYPTION_KEY` | 32 random bytes as 64 hex characters; held outside the database |
