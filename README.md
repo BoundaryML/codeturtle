@@ -44,7 +44,34 @@ Secrets belong in the ignored `backend/.env` or deployment secret store.
 
 Create `CODETURTLE.md` at the reviewed repository root; see the [policy syntax](cli/README.md).
 The PR comment groups requirements by reviewer and links to personal review pages.
-Reviewers sign in with WorkOS, link their own GitHub identity, inspect diffs and mark
-assigned parts reviewed. Decisions are tied to an immutable report/revision and
-respect Any/All rules. A new run starts a fresh review. These are CodeTurtle sign-offs;
-they do not submit GitHub approvals or change branch protection.
+Reviewers sign in with the isolated WorkOS AuthKit, link their own GitHub identity,
+and open the original CodeTurtle review workspace. Each owned file gets an explicit
+Approve or Reject decision; rejections require a reason. Decisions and inline
+comments remain private drafts until Submit review publishes them atomically.
+Any/All ownership rules accumulate. Changed files need new decisions; unchanged
+files retain approvals. Rejections survive new revisions until cleared by their
+reviewer or a repository administrator with an audited reason. Overrides do not
+supply approvals.
+
+The frontend ports the existing `tools/shep` website to TypeScript, preserving its
+CSS, fonts, turtle artwork, Monaco split/unified diff editor, file tree, comment
+controls, per-file decisions and review progress. The demonstration identities,
+fictional PR and simulated-commit controls are replaced by authenticated API data.
+The ownership tab shows evaluated rule provenance rather than fictional policy.
+
+The CLI evaluator is the original `tools/codeturtle` engine: `contracts.baml`,
+`engine.baml`, `help.baml`, `lint.baml`, `main.baml`, `models.baml` and
+`ownership.baml` are byte-identical to the source port. Changes surround it:
+independent packaging/runtime pinning, trusted Git input, root `CODETURTLE.md`
+loading, and authenticated CI reporting.
+
+These are CodeTurtle decisions and comments stored in the database. They do not
+submit native GitHub approvals or enforce branch protection. Slack remains
+unconfigured. Binary files, files over 1 MB and files outside GitHub's comparison
+response limit provide a GitHub fallback instead of an incomplete inline diff.
+Team owners require GitHub API access to verify team membership; individual
+GitHub handles work without that additional permission.
+
+The additive reviewer database migration must be applied before deploying this
+workspace. It is supplied separately as the operator SQL handoff. Deployment and
+publishing the updated GitHub Action are separate from local build/test success.

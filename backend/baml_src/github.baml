@@ -102,12 +102,16 @@ class GitHubClient {
         run: StoredRun,
         origin: string,
         decisions: ReviewDecision[] = [],
+        events: json[] = [],
     ) -> CommentRef {
         let i = run.authorized.identity;
         let token = self.installation_token(run.authorized.enrollment, write = true);
         let _ = self.current_pr(i, token);
         let marker = `<!-- codeturtle:${i.repository_id}:${i.pr} -->`;
-        let body = github_report(run, origin, decisions = decisions) + "\n" + marker;
+        let body = github_report(run, origin, decisions = decisions)
+            + review_audit_markdown(events)
+            + "\n"
+            + marker;
         // Reconcile before creation, including after a lost provider response.
         let page = 1;
         while (page <= 100) {
@@ -212,7 +216,8 @@ function github_report(run: StoredRun, origin: string, decisions: ReviewDecision
         }
         text += line;
     }
-    text += "\nSign-offs apply only to this report and commit. New pushes require a fresh review.\n";
+    text
+        += "\nEach file requires an explicit decision. Changed files need fresh decisions; unchanged files retain sign-offs. Changes requests remain until cleared by their reviewer or an audited administrator override.\n";
     text
 }
 
@@ -275,4 +280,56 @@ test "GitHub webhook HMAC standard vector" {
         hmac_sha256("key", "The quick brown fox jumps over the lazy dog"),
         "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8",
     )
+}
+
+function review_audit_markdown(events: json[]) -> string {
+    let text = "\n### Review activity\n";
+    for (
+        let event in events.slice(
+            if (events.length() > 20) {
+                events.length() - 20
+            } else {
+                0
+            },
+            events.length(),
+        )
+    ) {
+        let d = field(event, "data");
+        let line = if (field(event, "kind") == "override") {
+            "- Admin "
+                + safe_markdown(str(d, "by"))
+                + " overrode "
+                + safe_markdown(str(d, "user"))
+                + " on "
+                + safe_markdown(str(d, "file"))
+                + ": "
+                + safe_markdown(str(d, "reason"))
+                + "\n"
+        } else {
+            "- "
+                + safe_markdown(str(d, "user"))
+                + " "
+                + (
+                    if (field(d, "kind") == "approve") {
+                        "approved "
+                    } else {
+                        "requested changes on "
+                    }
+                )
+                + safe_markdown(str(d, "file"))
+                + ": "
+                + safe_markdown(str(d, "body"))
+                + "\n"
+        };
+        if (text.length() + line.length() > 8000) {
+            text += "Additional activity in the review workspace.\n";
+            break;
+        }
+        text += line;
+    }
+    if (events.length() == 0) {
+        ""
+    } else {
+        text
+    }
 }

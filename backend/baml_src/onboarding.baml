@@ -156,9 +156,21 @@ class Onboarding {
             let _ = self.github.api(
                 "GET",
                 e.repository,
-                "/contents/.github/codeturtle/OWNERS?ref=" + url_encode(branch),
+                "/contents/CODETURTLE.md?ref=" + url_encode(branch),
                 token,
-            );
+            ) catch (error) {
+                let err: ApiError => {
+                    if (err.status != 404) {
+                        throw err;
+                    }
+                    self.github.api(
+                        "GET",
+                        e.repository,
+                        "/contents/.github/codeturtle/OWNERS?ref=" + url_encode(branch),
+                        token,
+                    )
+                },
+            };
             let _ = self.store.rpc(
                 "trust_workflow",
                 {

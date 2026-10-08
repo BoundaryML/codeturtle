@@ -91,7 +91,7 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
  let app = ReportService {store: SupabaseStore {url: fixture_url, key: "fixture"}, github: GitHubClient {http: http, crypto: crypto, app_id: "test", private_key: baml.fs.read(key_path), bot_id: 999}, oidc: GitHubOIDC {http: http, crypto: crypto, audience: origin}, parser: report_parser(models_path), origin: origin, slack: SlackClient {http: http, secrets: SecretBox {key: uint8array.zeroes(32)}}, browser: BrowserAuth {store: SupabaseStore {url: fixture_url, key: "fixture"}, http: http, origin: origin, client_id: "test", client_secret: "test", secrets: SecretBox {key: uint8array.zeroes(32)}}, onboarding: null}; app.deliver_once()
 }'''
         (cls.project/'baml_src/fixture.baml').write_text(fixture)
-        cls.env=dict(os.environ,BAML_VERSION='0.20.2-nightly.20261004.a',CODETURTLE_GITHUB_CLIENT_ID='test',CODETURTLE_GITHUB_CLIENT_SECRET='test')
+        cls.env=dict(os.environ,BAML_VERSION='0.20.2-nightly.20261004.a',CODETURTLE_FRONTEND_DIR=str(ROOT/'frontend/dist'),CODETURTLE_GITHUB_CLIENT_ID='test',CODETURTLE_GITHUB_CLIENT_SECRET='test')
         cls.args=['--fixture_url',cls.mock_url,'--python',str(ROOT/'backend/.venv/bin/python'),'--crypto_path',str(ROOT/'backend/crypto.py'),'--models_path',str(ROOT/'cli/baml_src/models.baml'),'--key_path',str(cls.path/'key.pem'),'--origin',cls.origin]
         cls.log=open(cls.path/'service.log','w+');cls.addClassCleanup(cls.log.close)
         cls.start_service();cls.addClassCleanup(cls.stop_service)
@@ -136,11 +136,11 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
         if url == 'https://api.github.com/user':return {'id':1,'login':'one'}
         if url == 'https://github.com/login/oauth/access_token':return {'access_token':'reader'}
         if '/user/installations/' in url:return {'repositories':[{'id':42,'full_name':'acme/repo','permissions':{'admin':False,'pull':True},'default_branch':'main'}]}
-        if '/compare/' in url and '?' in url:return {'files':[{'filename':'a.txt','patch':'@@ -1 +1 @@\n-before\n+after'}]}
+        if '/compare/' in url and '?' in url:return {'files':[{'filename':'a.txt','sha':'d'*40,'status':'modified','additions':1,'deletions':1,'patch':'@@ -1 +1 @@\n-before\n+after'}]}
         if url.endswith('/.well-known/jwks'):return {'keys':[cls.jwk]}
         if url.endswith('/access_tokens'):return {'token':'installation'}
         if url.endswith('/repos/acme/repo'):return {'id':42,'permissions':{'admin':True,'pull':True},'default_branch':'main'}
-        if '/contents/' in url:return {'sha':'c'*40}
+        if '/contents/' in url:return {'sha':'c'*40,'encoding':'base64','size':6,'content':__import__('base64').b64encode(('before\n' if url.endswith(cls.base) else 'after\n').encode()).decode()}
         if '/actions/runs/' in url:return {'id':123,'run_attempt':1,'event':'pull_request_target','head_sha':cls.base,'path':'.github/workflows/codeturtle.yml','status':'in_progress','pull_requests':[{'number':7,'base':{'repo':{'id':42}}}]}
         if url.endswith('/pulls/7'):return {'state':'open','head':{'sha':cls.live_head},'base':{'sha':cls.base,'ref':'main','repo':{'id':42}},'title':'Test PR'}
         if '/compare/' in url:return {'merge_base_commit':{'sha':cls.base}}
@@ -329,53 +329,132 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
         body={'run_id':g['run_id'],'head':self.head,'indices':[0],'reviewed':True}
         return g,headers,actor,body
 
-    def test_personal_review_signoff_and_comment_update(self):
+    def workspace_fixture(self):
         g,headers,actor,body=self.review_fixture()
-        self.delivery();self.assertIn('| Reviewer | Parts | Progress | Review |',self.comments[0]['body'])
-        self.assertIn('reviewer=%40one',self.comments[0]['body'])
-        status,page=self.request('/api/review?run='+g['run_id'],headers=headers)
-        self.assertEqual(status,200,page);self.assertEqual(page['reviewer']['login'],'one')
-        self.assertEqual(self.request('/api/review/decision',body=body,headers=headers)[0],200)
-        self.assertEqual(self.request('/api/review/decision',body=body,headers=headers)[0],200)
-        self.assertEqual(self.sql('SELECT count(*) FROM codeturtle_private.review_decisions'),'1')
-        self.delivery();self.assertEqual(self.posts,1);self.assertIn('1/1 reviewed',self.comments[0]['body'])
-        _,page=self.request('/api/review?run='+g['run_id'],headers=headers)
-        self.assertEqual(page['completed_requirements'],0) # All still needs @two
-        self.stop_service();self.start_service()
-        self.assertEqual(self.sql('SELECT count(*) FROM codeturtle_private.review_decisions'),'1')
-        body['reviewed']=False
-        self.assertEqual(self.request('/api/review/decision',body=body,headers=headers)[0],200)
-        self.assertEqual(self.sql('SELECT count(*) FROM codeturtle_private.review_decisions'),'0')
+        status,page=self.request('/api/workspace?run='+g['run_id'],headers=headers)
+        self.assertEqual(status,200,page)
+        decision={'id':str(uuid.uuid4()),'file':'a.txt','user':'one','revision':page['files'][0]['revision'],'kind':'approve','body':''}
+        body={'run_id':g['run_id'],'head':self.head,'action':'draft','draft':{'decisions':[decision],'comments':[]}}
+        return g,headers,actor,body
 
-    def test_review_mutation_requires_identity_csrf_current_revision(self):
-        g,headers,actor,body=self.review_fixture()
-        self.assertEqual(self.request('/api/review/decision',body=body)[0],401)
-        self.assertEqual(self.request('/api/review/decision',body=body,headers={'Cookie':headers['Cookie']})[0],403)
-        self.assertEqual(self.request('/api/review/decision',body=dict(body,head='f'*40),headers=headers)[0],409)
-        self.assertEqual(self.request('/api/review/decision',body=dict(body,indices=[0,99]),headers=headers)[0],400)
-        self.assertEqual(self.sql('SELECT count(*) FROM codeturtle_private.review_decisions'),'0')
+    def test_private_drafts_atomic_submit_and_comment_update(self):
+        g,headers,actor,body=self.workspace_fixture()
+        self.delivery();self.assertIn('| Reviewer | Parts | Progress | Review |',self.comments[0]['body'])
+        self.assertEqual(self.request('/api/workspace',body=body,headers=headers)[0],200)
+        self.assertEqual(self.sql('SELECT count(*) FROM codeturtle_private.review_events'),'0')
+        other,other_actor=self.reviewer_session('other')
+        status,view=self.request('/api/workspace?run='+g['run_id'],headers=other)
+        self.assertEqual(view['state']['draft']['decisions'],[])
+        status,data=self.request('/api/workspace',body=dict(body,action='submit'),headers=headers)
+        self.assertEqual(status,200,data)
+        self.assertEqual(len(data['events']),1);self.assertEqual(data['draft']['decisions'],[])
+        self.assertEqual(self.request('/api/workspace',body=dict(body,action='submit'),headers=headers)[0],400)
+        self.delivery();self.assertEqual(self.posts,1);self.assertIn('1/1 reviewed',self.comments[0]['body'])
+        self.stop_service();self.start_service()
+        _,page=self.request('/api/review?run='+g['run_id'],headers=headers)
+        self.assertEqual(page['completed_requirements'],0) # All still requires @two.
+        status,data=self.request('/api/workspace/content?run='+g['run_id']+'&file=a.txt',headers=headers)
+        self.assertEqual(status,200,data);self.assertEqual(data,{'original':'before\n','modified':'after\n'})
+
+    def test_workspace_mutation_requires_identity_csrf_current_revision(self):
+        g,headers,actor,body=self.workspace_fixture()
+        self.assertEqual(self.request('/api/workspace',body=body)[0],401)
+        self.assertEqual(self.request('/api/workspace',body=body,headers={'Cookie':headers['Cookie']})[0],403)
+        self.assertEqual(self.request('/api/workspace',body=dict(body,head='f'*40),headers=headers)[0],409)
         other,_=self.reviewer_session('other','2')
-        self.assertEqual(self.request('/api/review/decision',body=body,headers=other)[0],403)
+        self.assertEqual(self.request('/api/workspace',body=body,headers=other)[0],403)
         alien,_=self.reviewer_session('alien','1','different-tenant')
-        self.assertEqual(self.request('/api/review/decision',body=body,headers=alien)[0],403)
+        self.assertEqual(self.request('/api/workspace',body=body,headers=alien)[0],403)
         type(self).live_head='f'*40
-        self.assertEqual(self.request('/api/review/decision',body=body,headers=headers)[0],409)
+        self.assertEqual(self.request('/api/workspace',body=body,headers=headers)[0],409)
         type(self).live_head=self.head
         self.sql('UPDATE codeturtle_private.runs SET superseded=true')
-        self.assertEqual(self.request('/api/review/decision',body=body,headers=headers)[0],409)
+        self.assertEqual(self.request('/api/workspace',body=body,headers=headers)[0],409)
 
     def test_signoff_during_comment_delivery_is_not_lost(self):
-        g,headers,actor,body=self.review_fixture()
+        g,headers,actor,body=self.workspace_fixture()
         lease=self.rpc('ct_lease',{})
-        self.assertEqual(self.request('/api/review/decision',body=body,headers=headers)[0],200)
+        self.assertEqual(self.request('/api/workspace',body=body,headers=headers)[0],200)
+        self.assertEqual(self.request('/api/workspace',body=dict(body,action='submit'),headers=headers)[0],200)
         self.assertIsNone(self.rpc('ct_lease',{}))
         self.rpc('ct_delivery_done',{'id':g['run_id'],'destination':'github','lease':lease['lease'],'reference':{'id':1}})
         self.assertIsNotNone(self.rpc('ct_lease',{}))
 
-    def test_unassigned_reviewer_cannot_mark_parts(self):
-        g,headers,actor,body=self.review_fixture()
-        self.sql("UPDATE codeturtle_private.runs SET envelope=jsonb_set(envelope,'{report,requirements,0,owners}','[\"@two\"]')")
-        self.assertEqual(self.request('/api/review/decision',body=body,headers=headers)[0],403)
+    def test_workspace_rejects_spoofed_decisions_and_empty_rejections(self):
+        g,headers,actor,body=self.workspace_fixture()
+        decision=body['draft']['decisions'][0]
+        for field,value,status in [('file','not-owned',403),('user','two',403),('revision','wrong',403),('kind','changes',400),('kind','invalid',400)]:
+            invalid=json.loads(json.dumps(body));invalid['draft']['decisions'][0][field]=value
+            self.assertEqual(self.request('/api/workspace',body=invalid,headers=headers)[0],status,(field,value))
+        self.assertEqual(self.sql('SELECT count(*) FROM codeturtle_private.review_events'),'0')
+        self.assertEqual(self.request('/api/review/decision',body=body,headers=headers)[0],410)
+
+    def test_rejection_and_admin_override_never_grant_approval(self):
+        g,headers,actor,body=self.workspace_fixture()
+        decision=body['draft']['decisions'][0];decision.update(kind='changes',body='Please fix the timeout')
+        self.assertEqual(self.request('/api/workspace',body=body,headers=headers)[0],200)
+        self.assertEqual(self.request('/api/workspace',body=dict(body,action='submit'),headers=headers)[0],200)
+        published=self.rpc('ct_workspace',{'id':g['run_id'],'actor':actor})['events'][0]['data']['id']
+        override=dict(body,action='override',block=published,reason='Accepted as a follow-up fix')
+        self.assertEqual(self.request('/api/workspace',body=override,headers=headers)[0],403)
+        self.sql("UPDATE codeturtle_private.memberships SET can_setup=true")
+        status,data=self.request('/api/workspace',body=override,headers=headers)
+        self.assertEqual(status,200,data);self.assertEqual(data['events'][-1]['kind'],'override')
+        self.assertEqual(self.rpc('ct_review_decisions',{'id':g['run_id']}),[])
+        self.delivery();self.assertIn('overrode',self.comments[0]['body'])
+
+    def test_every_file_requires_explicit_decision_and_submit_is_atomic(self):
+        g,headers,actor,body=self.workspace_fixture()
+        snapshot=self.rpc('ct_workspace_snapshot',{'id':g['run_id'],'actor':actor})
+        second=dict(snapshot[0],id='second.txt');snapshot.append(second)
+        self.sql("UPDATE codeturtle_private.review_snapshots SET files='"+json.dumps(snapshot).replace("'","''")+"'")
+        self.assertEqual(self.request('/api/workspace',body=body,headers=headers)[0],200)
+        status,data=self.request('/api/workspace',body=dict(body,action='submit'),headers=headers)
+        self.assertEqual(status,409,data);self.assertEqual(self.sql('SELECT count(*) FROM codeturtle_private.review_events'),'0')
+        body['draft']['decisions'].append(dict(body['draft']['decisions'][0],id=str(uuid.uuid4()),file='second.txt'))
+        self.assertEqual(self.request('/api/workspace',body=body,headers=headers)[0],200)
+        self.assertEqual(self.request('/api/workspace',body=dict(body,action='submit'),headers=headers)[0],200)
+        self.assertEqual(self.sql('SELECT count(*) FROM codeturtle_private.review_events'),'2')
+
+    def test_file_revisions_carry_approval_and_preserve_blocks_across_runs(self):
+        g,headers,actor,body=self.workspace_fixture()
+        self.assertEqual(self.request('/api/workspace',body=body,headers=headers)[0],200)
+        self.assertEqual(self.request('/api/workspace',body=dict(body,action='submit'),headers=headers)[0],200)
+        next_id=str(uuid.uuid4())
+        self.sql("INSERT INTO codeturtle_private.runs(id,repository_id,pr,run_id,attempt,authorized,token_hash,expires_at,digest,envelope,accepted_at) SELECT '"+next_id+"',repository_id,pr,456,attempt,authorized,token_hash,expires_at,digest,envelope,accepted_at FROM codeturtle_private.runs")
+        self.sql("INSERT INTO codeturtle_private.review_snapshots SELECT '"+next_id+"',files FROM codeturtle_private.review_snapshots WHERE run_id='"+g['run_id']+"'")
+        self.assertEqual(len(self.rpc('ct_review_decisions',{'id':next_id})),1)
+        self.sql("UPDATE codeturtle_private.review_snapshots SET files=jsonb_set(files,'{0,revision}','\"changed-file\"') WHERE run_id='"+next_id+"'")
+        self.assertEqual(self.rpc('ct_review_decisions',{'id':next_id}),[])
+        self.sql("UPDATE codeturtle_private.review_events SET data=jsonb_set(data,'{kind}','\"changes\"')")
+        events=self.rpc('ct_workspace',{'id':next_id,'actor':actor})['events']
+        self.assertEqual(events[0]['data']['kind'],'changes')
+
+    def test_frontend_serves_original_editor_worker_and_font_bytes(self):
+        assets=ROOT/'frontend/dist/assets'
+        for path in [ROOT/'frontend/dist/index.html',next(assets.glob('editor.worker-*.js')),next(assets.glob('*.woff2'))]:
+            route='/' if path.name=='index.html' else '/assets/'+path.name
+            with urllib.request.urlopen(self.origin+route) as response:
+                self.assertEqual(response.read(),path.read_bytes())
+                self.assertEqual(response.headers['x-content-type-options'],'nosniff')
+                self.assertIn("script-src 'self'",response.headers['content-security-policy'])
+
+    def test_outdated_comments_remain_private_and_must_be_discarded(self):
+        g,headers,actor,body=self.workspace_fixture()
+        decision=body['draft']['decisions'][0]
+        comment={**decision,'line':1,'side':'RIGHT','body':'Private note','replyTo':None};comment.pop('kind')
+        body['draft']['comments']=[comment]
+        self.assertEqual(self.request('/api/workspace',body=body,headers=headers)[0],200)
+        self.sql("UPDATE codeturtle_private.review_snapshots SET files=jsonb_set(files,'{0,revision}','\"changed-file\"')")
+        _,page=self.request('/api/workspace?run='+g['run_id'],headers=headers)
+        self.assertEqual(page['state']['draft']['decisions'],[])
+        self.assertEqual(len(page['state']['draft']['comments']),1)
+        decision['revision']='changed-file'
+        self.assertEqual(self.request('/api/workspace',body=body,headers=headers)[0],200)
+        self.assertEqual(self.request('/api/workspace',body=dict(body,action='submit'),headers=headers)[0],409)
+        body['draft']['comments']=[]
+        self.assertEqual(self.request('/api/workspace',body=body,headers=headers)[0],200)
+        self.assertEqual(self.request('/api/workspace',body=dict(body,action='submit'),headers=headers)[0],200)
 
     def test_reviewer_link_cannot_rebind_installation(self):
         g=self.register();self.upload(g,self.envelope(g))

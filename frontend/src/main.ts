@@ -1,65 +1,232 @@
-type Identity = {repository_id:string;repository:string;pr:number;head:string;base:string;policy:string;run_id:string;run_attempt:number};
-type Requirement = {path:string;owners:string[];approval:'Any'|'All';evaluation:{result:{verdict:string;reason:string;evidence:string[]}}};
-type Review = {run_id:string;identity:Identity;title:string;accepted_at:string|null;superseded:boolean;status:string;envelope:null|{setup_failure:null|{message:string};report:null|{requirements:Requirement[];errors:{message:string}[];unowned_files:string[];evaluation_complete:boolean}};deliveries:Record<string,{status:string;error:string|null}>};
-type Session={csrf:string;repositories:{id:string;name:string;can_setup:boolean;latest_run:string|null}[]};
-const app=document.querySelector<HTMLElement>('#app')!;
-let csrf='';
-function el<K extends keyof HTMLElementTagNameMap>(tag:K,text='',className=''):HTMLElementTagNameMap[K]{const e=document.createElement(tag);e.textContent=text;e.className=className;return e;}
-function link(text:string,href:string){const a=el('a',text);a.href=href;return a;}
-async function api<T>(path:string,body?:unknown):Promise<T>{const r=await fetch(path,{method:body===undefined?'GET':'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:body===undefined?undefined:JSON.stringify(body)});if(r.status===401){app.replaceChildren(el('h1','Sign in to CodeTurtle'),link('Continue with WorkOS','/auth/login?next='+encodeURIComponent(location.pathname+location.search)));throw new Error('Sign in required');}if(!r.ok){const data=await r.json();throw new Error(String(data.error??'Request failed'));}return r.json() as Promise<T>;}
-function error(e:unknown){app.append(el('p',e instanceof Error?e.message:'Request failed','error'));}
-type Decision = {requirement_index:number;owner:string;github_user_id:string;github_login:string;reviewed_at:string};
-type ReviewerRow = {owner:string;parts:string[];indices:number[];completed:number;url:string};
-type ReviewPage = {review:Review;reviewer:{user_id:string;login:string;eligible_owners:string[]};decisions:Decision[];reviewers:ReviewerRow[];current:boolean;completed_requirements:number;total_requirements:number};
-async function load_review(run:string) {
-  try { render_review(await api<ReviewPage>('/api/review?run='+encodeURIComponent(run))); }
-  catch(e) {
-    if(e instanceof Error && e.message==='repository_forbidden') {
-      app.replaceChildren(el('h1','Connect your GitHub identity'),el('p','Verify your repository access to open this review.'));
-      app.append(link('Continue with GitHub','/auth/github/start?run='+encodeURIComponent(run)+'&next='+encodeURIComponent(location.pathname+location.search)));
-    } else { throw e; }
+import '@fontsource/geist/latin-400.css';
+import '@fontsource/geist/latin-600.css';
+import 'hack-font/build/web/hack.css';
+import * as monaco from 'monaco-editor/editor/editor.api';
+import 'monaco-editor/languages/definitions/rust/register';
+import 'monaco-editor/languages/definitions/markdown/register';
+import EditorWorker from 'monaco-editor/editor/editor.worker?worker';
+import '../node_modules/monaco-editor/esm/vs/base/browser/ui/codicons/codicon/codicon.css';
+import { files, reviewers, ownership, state, page, load, saveDrafts, publish, overrideBlock, loadContent, fileStatus, owns, busy, type ReviewFile, type Decision, type Comment, type Side } from './workspace';
+import { dashboard } from './dashboard';
+import './style.css';
+
+(self as unknown as { MonacoEnvironment: { getWorker: () => Worker } }).MonacoEnvironment = { getWorker: () => new EditorWorker() };
+monaco.languages.register({ id: 'baml' });
+monaco.languages.setMonarchTokensProvider('baml', { tokenizer: { root: [[/\b(class|enum|function|client|test|retry_policy)\b/, 'keyword'], [/\b(string|int|float|bool)\b/, 'type'], [/"[^"\\]*(?:\\.[^"\\]*)*"/, 'string'], [/\/\/.*$/, 'comment'], [/\b\d+\b/, 'number'], [/@[\w]+/, 'annotation']] } });
+monaco.editor.defineTheme('codeturtle', {
+  base: 'vs-dark', inherit: true,
+  rules: [{ token: 'comment', foreground: '7D8594' }, { token: 'keyword', foreground: 'C8BAFF' }, { token: 'string', foreground: '91D8C0' }, { token: 'number', foreground: 'E4B77B' }, { token: 'type', foreground: '8DB8CF' }],
+  colors: { 'editor.background': '#18171a', 'editorGutter.background': '#18171a', 'editorLineNumber.foreground': '#5f6777', 'editorLineNumber.activeForeground': '#d0d0d7', 'editor.lineHighlightBackground': '#232225', 'diffEditor.insertedTextBackground': '#73be8528', 'diffEditor.removedTextBackground': '#da777c25', 'diffEditor.insertedLineBackground': '#51835c12', 'diffEditor.removedLineBackground': '#b7585f12', 'editor.selectionBackground': '#ff570a30', 'editorWidget.background': '#232225', 'editorOverviewRuler.border': '#2b292d' },
+});
+
+const escape = (value: unknown): string => String(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' } as Record<string,string>)[char]!);
+
+let diffEditor: monaco.editor.IStandaloneDiffEditor | undefined, models: monaco.editor.ITextModel[] = [];
+const app = document.querySelector<HTMLElement>('#app')!;
+const selected = () => files.find(file => file.id === state.selected)!;
+const mine = () => files.filter(file => owns(file));
+const myDrafts = () => state.drafts.filter(draft => draft.user === state.user);
+const myPendingDecisions = () => state.pendingDecisions.filter(decision => decision.user === state.user);
+const currentDecision = (file: ReviewFile) => { const latest=[...state.decisions].reverse().find(decision => decision.file === file.id && decision.user === state.user); return latest?.revision===state.revision[file.id]?latest:undefined; };
+const stagedDecision = (file: ReviewFile) => myPendingDecisions().find(decision => decision.file === file.id && decision.revision === state.revision[file.id]);
+const myDecision = (file: ReviewFile) => stagedDecision(file) || currentDecision(file);
+const undecidedFiles = () => mine().filter(file => !myDecision(file));
+function personalStatus(file: ReviewFile) {
+  const decision = myDecision(file);
+  return { state: decision?.kind === 'approve' ? 'approved' : decision?.kind === 'changes' ? 'blocked' : 'pending', label: decision ? `${decision.kind === 'approve' ? 'Approved' : 'Rejected'}${stagedDecision(file) ? ' · draft' : ''}` : 'Not reviewed' };
+}
+
+
+const statusLabel: Record<string,string> = { pending: 'Awaiting sign-off', approved: 'Approved', blocked: 'Changes requested', unowned: 'No owner assigned' };
+
+function avatar(user: string, small = false) {
+  const info = reviewers[user];
+  return `<span class="avatar ${small ? 'small' : ''}" style="--avatar-color:${info?.color || '#8191aa'}" aria-hidden="true">${info?.initials || 'S'}</span>`;
+}
+
+function summary() {
+  const owned = files.filter(file => file.owners.length);
+  const approved = owned.filter(file => fileStatus(file, state).state === 'approved').length;
+  const blocked = owned.filter(file => fileStatus(file, state).state === 'blocked').length;
+  return { owned, approved, blocked, ready: owned.length > 0 && approved === owned.length && !blocked && page.review.envelope?.report?.evaluation_complete === true };
+}
+
+function reviewerProgress(user: string) {
+  const owned = files.filter(file => file.owners.includes(user));
+  const approved = owned.filter(file => fileStatus(file, state).approvals.has(user)).length;
+  return `${approved}/${owned.length}`;
+}
+
+function header() {
+ return `<header class="appbar"><div class="brand"><a href="/"><img class="brand-logo" src="/codeturtle.svg" alt="Repositories" /></a><span class="brand-wordmark">codeturtle<span class="brand-tagline">Review at human speed.</span></span><span class="brand-divider">/</span><span class="repo-name">${escape(page.review.identity.repository)}</span></div><nav aria-label="Workspace">${[['review','Review'],['github','PR message'],['slack','Slack'],['ownership','Ownership']].map(([tab,label])=>`<button data-tab="${tab}" class="${state.tab===tab?'active':''}">${label}</button>`).join('')}</nav><span class="identity">${avatar(state.user,true)}@${escape(state.user)}</span></header><section class="prbar"><div class="pr-title"><div class="pr-kicker"><span class="codicon codicon-git-pull-request"></span><a href="https://github.com/${escape(page.review.identity.repository)}/pull/${page.review.identity.pr}">Pull request #${page.review.identity.pr}</a></div><h1>${escape(page.review.title)}</h1><div class="prmeta"><code>${page.review.identity.head.slice(0,12)}</code><span>· ${files.length} files changed</span>${page.review.envelope?.report?.errors.map(e=>`<span class="blocked">${escape(e.message)}</span>`).join('') || ''}${page.review.envelope?.report?.unowned_files.length?'<span class="blocked">Ownership gaps need attention</span>':''}${!page.current?'<span class="blocked">Outdated report · open the latest PR comment</span>':''}</div></div></section>`;
+}
+
+function fileTree() {
+  const visible = state.showAll ? files : mine();
+  return `<aside class="filetree"><div class="section-label">${state.showAll ? 'Changed files' : 'Your files'} <span>${visible.length}</span></div><div class="tree-filter"><span class="codicon codicon-filter" aria-hidden="true"></span>${state.showAll ? 'All changed files' : `Owned by @${escape(state.user)}`}</div><div class="filelist">${visible.map(file => {
+    const status = owns(file) ? personalStatus(file) : { ...fileStatus(file, state), label: statusLabel[fileStatus(file, state).state] };
+    const shortPath = file.directory.includes('baml_env') ? 'crates / baml_env / src' : file.directory.includes('baml_std') ? 'baml_std / baml / ns_http' : file.directory === 'baml_language' ? 'baml_language' : file.directory;
+    return `<div class="file-group"><div class="file-directory" title="${escape(file.directory)}">${escape(shortPath)}</div><button class="file ${state.selected === file.id ? 'selected' : ''}" data-file="${escape(file.id)}" title="${escape(file.directory + '/' + file.name)}"><span class="codicon codicon-file-code" aria-hidden="true"></span><strong>${escape(file.name)}</strong><span class="file-dot ${status.state}" role="img" aria-label="${status.label}"></span></button></div>`;
+  }).join('')}</div><button class="reveal-files" data-action="show-all"><span class="codicon codicon-${state.showAll ? 'eye-closed' : 'eye'}" aria-hidden="true"></span>${state.showAll ? 'Hide other files' : `Show ${files.length - mine().length} other ${files.length - mine().length === 1 ? 'file' : 'files'}`}</button><div class="tree-foot"><button data-tab="ownership"><span class="codicon codicon-symbol-key" aria-hidden="true"></span> CODETURTLE.md (or legacy OWNERS)</button><span>Rules from the target branch</span></div></aside>`;
+}
+
+function commentCard(comment: Comment, draft = false) {
+  const outdated = comment.revision !== state.revision[comment.file];
+  return `<article class="comment-card ${draft ? 'draft' : ''}"><div class="comment-meta">${avatar(comment.user, true)}<strong>@${escape(comment.user)}</strong><span>${comment.side === 'LEFT' ? 'Original' : 'New'} line ${comment.line}</span>${draft ? '<span class="draft-label">Draft</span>' : ''}${outdated ? '<span class="outdated">Outdated</span>' : ''}</div><p>${escape(comment.body)}</p>${draft ? `<button class="text-button" data-remove-draft="${escape(comment.id)}">Discard draft</button>` : `<button class="text-button" data-reply="${escape(comment.id)}">Reply</button>`}</article>`;
+}
+
+function reviewPane() {
+  const file = selected();
+  const isMine = owns(file) && page.current;
+  const status = fileStatus(file, state);
+  const comments = state.comments.filter(comment => comment.file === file.id);
+  const drafts = myDrafts().filter(comment => comment.file === file.id);
+  const decision = myDecision(file);
+  const staged = stagedDecision(file);
+  return `<section class="review-pane"><div class="editor-toolbar"><div class="editor-file"><span class="codicon codicon-file-code" aria-hidden="true"></span><strong>${escape(file.name)}</strong><span class="changes"><span>+${file.additions}</span><span>−${file.deletions}</span></span></div><div class="editor-actions"><button class="button small ghost" data-action="layout"><span class="codicon codicon-split-horizontal" aria-hidden="true"></span>${state.split ? 'Unified' : 'Split'}</button><button class="button small ghost" data-action="comment" ${!isMine ? 'disabled' : ''}><span class="codicon codicon-comment" aria-hidden="true"></span>Add comment</button></div></div>
+    <div class="file-breadcrumb" title="${escape(file.directory + '/' + file.name)}">${escape(file.directory)}<span>/</span><strong>${escape(file.name)}</strong></div><div id="editor" aria-label="Diff for ${escape(file.name)}"></div>${file.contentError?`<p class="decision-reason">${escape(file.contentError)} · <a href="https://github.com/${escape(page.review.identity.repository)}/pull/${page.review.identity.pr}/files">Open files on GitHub</a></p>`:''}
+    <div class="file-decision-bar"><div class="decision-summary"><span class="decision-label">Your decision</span><span class="${decision?.kind === 'approve' ? 'approved' : decision?.kind === 'changes' ? 'blocked' : ''}">${isMine ? decision ? `${decision.kind === 'approve' ? 'Approved' : 'Rejected'}${staged ? ' · unpublished' : ' · submitted'}` : 'Not reviewed' : 'Read-only · not your file'}</span></div>${isMine ? `<div class="decision-actions"><button class="button small approve-file ${decision?.kind === 'approve' ? 'chosen' : ''}" data-action="approve-file" aria-pressed="${decision?.kind === 'approve'}"><span class="codicon codicon-check" aria-hidden="true"></span>Approve file</button><button class="button small reject-file ${decision?.kind === 'changes' ? 'chosen' : ''}" data-action="reject-file" aria-pressed="${decision?.kind === 'changes'}"><span class="codicon codicon-close" aria-hidden="true"></span>Reject file</button>${staged ? '<button class="text-button undo-decision" data-action="undo-decision">Undo</button>' : ''}</div>` : ''}</div>
+    ${decision?.kind === 'changes' ? `<div class="decision-reason">${escape(decision.body)}</div>` : ''}
+    <div class="file-review-state"><span class="status-tag ${status.state}"><span class="file-dot ${status.state}"></span>${statusLabel[status.state]}</span><span>Required owner approvals</span></div>
+    <section class="conversation ${comments.length + drafts.length ? 'has-comments' : ''}"><div class="conversation-heading"><h2><span class="codicon codicon-comment-discussion" aria-hidden="true"></span>Comments <span>${comments.length + drafts.length}</span></h2><span>${drafts.length ? `${drafts.length} unpublished ${drafts.length === 1 ? 'draft' : 'drafts'}` : 'Publish with your review'}</span></div>${[...comments.map(c => commentCard(c)), ...drafts.map(c => commentCard(c, true))].join('')}</section></section>`;
+}
+
+function progressPanel() {
+  const data = summary();
+  const file = selected();
+  const status = fileStatus(file, state);
+  const remaining = undecidedFiles().length;
+  const decisionCount = mine().length - remaining;
+  const publishable = myPendingDecisions().length || myDrafts().length;
+  return `<aside class="progress-panel"><div class="review-context"><section class="progress-overview"><div class="section-label">Pull request status</div><div class="gate-state ${data.ready ? 'approved' : data.blocked ? 'blocked' : ''}"><span class="codicon codicon-${data.ready ? 'pass' : data.blocked ? 'error' : 'circle-large-outline'}" aria-hidden="true"></span>${data.ready ? 'Reviews complete' : data.blocked ? 'Changes requested' : 'Review required'}</div><div class="approval-summary"><span>Files approved</span><strong>${data.approved} / ${data.owned.length}</strong></div><div class="progress-track"><span style="width:${(data.owned.length ? data.approved / data.owned.length * 100 : 0)}%"></span></div></section>
+    <section class="file-ownership"><div class="section-label">Owners of ${escape(file.name)}</div><p class="ownership-mode">${file.requirements.length > 1 ? 'Every matching rule must be satisfied (see rules below)' : file.all ? 'All listed owners must approve' : file.owners.length ? 'One owner must approve' : 'No owner assigned'}</p>${file.owners.map(user => `<div class="reviewer-row">${avatar(user, true)}<strong>@${escape(user)}</strong><span class="owner-decision ${status.activeBlocks.some(b => b.user === user) ? 'blocked' : status.approvals.has(user) ? 'approved' : ''}" title="${status.activeBlocks.some(b => b.user === user) ? 'Changes requested' : status.approvals.has(user) ? 'Approved' : 'Awaiting approval'}"><span class="codicon codicon-${status.activeBlocks.some(b => b.user === user) ? 'error' : status.approvals.has(user) ? 'check' : 'circle-outline'}" aria-hidden="true"></span></span></div>`).join('')}
+    <details class="ownership-details"><summary>Why these owners?</summary><div><code>${escape(file.rule || 'No matching rule')}</code><button class="text-button" data-tab="ownership">CODETURTLE.md (or legacy OWNERS)${file.rule ? `:${file.ruleLine}` : ''} ↗</button><p>${file.rule ? 'Matching ownership rule on the target branch.' : 'This file has no matching ownership rule.'}</p></div></details></section>
+    ${status.activeBlocks.map(block => `<div class="block-card"><strong>@${escape(block.user)} requested changes</strong><p>${escape(block.body || 'This file needs another look.')}</p>${page.admin ? `<button class="button small warning" data-override="${escape(block.user)}">Override block</button>` : '<span>The reviewer or a repository admin can clear this block.</span>'}</div>`).join('')}
+    <section class="all-reviewers"><div class="section-label">All reviewers <span>Files approved</span></div>${Object.keys(reviewers).map(user => `<div class="reviewer-row">${avatar(user, true)}<strong>@${escape(user)}</strong><span class="review-count">${reviewerProgress(user)}</span></div>`).join('')}</section>
+    <details class="activity"><summary>Activity <span>${state.activity.length}</span></summary>${state.activity.slice(-4).reverse().map(event => `<div><p>${escape(event.text)}</p><span>${escape(event.at)}</span></div>`).join('')}</details>
+    </div><div class="submit-section">${myDrafts().filter(d=>d.revision!==state.revision[d.file]).map(d=>`<p class="outdated">Outdated draft: ${escape(d.file)} <button class="text-button" data-remove-draft="${escape(d.id)}">Discard outdated draft</button></p>`).join('')}<div class="your-review-progress"><span>Your review</span><strong>${decisionCount} / ${mine().length} files</strong></div><p>${remaining ? `Decide on ${remaining === 1 ? 'the remaining file' : `each of the ${remaining} remaining files`}` : 'Every file has an explicit decision'}</p><button class="button primary" data-action="submit" ${!page.current || remaining || !publishable ? 'disabled' : ''}>Submit review<span class="codicon codicon-arrow-right" aria-hidden="true"></span></button><span>${publishable ? `${myPendingDecisions().length} ${myPendingDecisions().length === 1 ? 'decision' : 'decisions'} · ${myDrafts().length} ${myDrafts().length === 1 ? 'comment' : 'comments'} unpublished` : remaining ? 'Approve or reject each file in the diff' : 'No unpublished decisions or comments'}</span></div></aside>`;
+}
+
+function githubPreview() {
+ const data=summary();
+ return `<main class="preview-page"><div class="preview-heading"><span class="eyebrow">GITHUB · PR CONVERSATION</span><h2>GitHub comment</h2><p>CodeTurtle updates its PR comment after submitted reviews.</p></div><div class="github-shell"><div class="github-comment"><div class="github-comment-header"><img class="brand-logo" src="/codeturtle.svg" alt=""/><strong>codeturtle[bot]</strong></div><div class="github-comment-body"><h3>CodeTurtle · Owner review</h3><p>${data.approved} of ${data.owned.length} owned files approved</p><table><thead><tr><th>Reviewer</th><th>Parts</th><th>Review</th></tr></thead><tbody>${Object.keys(reviewers).map(user=>`<tr><td>@${escape(user)}</td><td>${files.filter(f=>f.owners.includes(user)).map(f=>escape(f.id)).join('<br>')}</td><td><a href="/?run=${encodeURIComponent(page.review.run_id)}&reviewer=${encodeURIComponent('@'+user)}">Open individual review</a></td></tr>`).join('')}</tbody></table>${state.overrides.map(o=>`<p>Admin @${escape(o.by)} overrode @${escape(o.user)}’s block: ${escape(o.reason)}</p>`).join('')}<p>Publication: ${escape(page.review.deliveries.github?.status || 'pending')}. This review state does not enforce a GitHub branch protection check.</p></div></div></div></main>`;
+}
+function slackPreview() {
+ return `<main class="preview-page"><div class="preview-heading"><h2>Slack</h2><p>Slack is not connected for this setup. Reviews and assignments are available in the GitHub PR comment.</p></div></main>`;
+}
+function ownershipPreview() {
+ return `<main class="ownership-page"><div class="preview-heading"><span class="eyebrow">OWNERSHIP · TARGET BRANCH</span><h2>Ownership rules</h2><p>CODETURTLE.md supplies the rules, with legacy OWNERS supported. Matching rules accumulate.</p></div><pre>${escape(ownership)}</pre><div class="rule-explanations"><article><h3>Review what you own</h3><p>Any listed owner can sign off by default. Rules marked All require every listed owner.</p></article><article><h3>Every file gets a decision</h3><p>Decisions and comments remain private until Submit review. Changed files need fresh decisions; unchanged files retain their approvals.</p></article><article><h3>Accountable overrides</h3><p>Repository administrators can clear a block with an audited reason. An override does not supply an approval.</p></article></div></main>`;
+}
+
+function render() {
+  diffEditor?.dispose(); models.forEach(model => model.dispose()); models = [];
+  app.innerHTML = header() + (state.tab === 'review' ? `<main class="workspace">${fileTree()}${reviewPane()}${progressPanel()}</main>` : state.tab === 'github' ? githubPreview() : state.tab === 'slack' ? slackPreview() : ownershipPreview()) + '<div id="toast" role="status" aria-live="polite"></div>';
+  if (state.tab !== 'review') return;
+  const file = selected();
+  const modified = file.modified;
+  models = [monaco.editor.createModel(file.original, file.language), monaco.editor.createModel(modified, file.language)];
+  diffEditor = monaco.editor.createDiffEditor(document.querySelector<HTMLElement>('#editor')!, { theme: 'codeturtle', readOnly: true, originalEditable: false, renderSideBySide: state.split, useInlineViewWhenSpaceIsLimited: true, automaticLayout: true, minimap: { enabled: false }, fontSize: 13, lineHeight: 22, fontFamily: 'Hack, monospace', scrollBeyondLastLine: false, glyphMargin: true, lineNumbersMinChars: 3, renderOverviewRuler: false, diffCodeLens: false, wordWrap: 'on', stickyScroll: { enabled: false }, accessibilitySupport: 'on', padding: { top: 16, bottom: 16 }, hideUnchangedRegions: { enabled: false } });
+  diffEditor.setModel({ original: models[0], modified: models[1] });
+  for (const [editor, side] of [[diffEditor.getOriginalEditor(), 'LEFT'], [diffEditor.getModifiedEditor(), 'RIGHT']] as const) {
+    editor.addAction({ id: `codeturtle-comment-${side}`, label: 'Draft a CodeTurtle comment', contextMenuGroupId: 'navigation', contextMenuOrder: 1, run: () => openComment(editor.getPosition()?.lineNumber || 1, side) });
+    editor.onMouseDown(event => {
+      if (event.target.type === monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN && event.target.position) openComment(event.target.position.lineNumber, side);
+    });
+    const comments = [...state.comments, ...myDrafts()].filter(c => c.file === file.id && c.side === side && c.revision === state.revision[file.id]);
+    editor.createDecorationsCollection(comments.map(c => ({ range: new monaco.Range(c.line, 1, c.line, 1), options: { isWholeLine: true, className: 'codeturtle-comment-line', glyphMarginClassName: 'codeturtle-comment-glyph', glyphMarginHoverMessage: { value: `CodeTurtle comment by @${c.user}` } } })));
   }
 }
-function render_review(page:ReviewPage) {
-  const view=page.review, report=view.envelope?.report;
-  const selected=new URLSearchParams(location.search).get('reviewer')?.toLowerCase();
-  const own=page.reviewer.eligible_owners;
-  app.replaceChildren(link('← Repositories','/'),el('h1',view.title));
-  app.append(link(`${view.identity.repository} #${view.identity.pr}`,`https://github.com/${view.identity.repository}/pull/${view.identity.pr}`));
-  app.append(el('p',`Signed in as @${page.reviewer.login} · Reviewing commit ${view.identity.head.slice(0,12)}`));
-  if(view.superseded || !page.current) app.append(el('p','This report is no longer current or its revision could not be verified. Sign-offs are disabled. Open the latest CodeTurtle comment on the PR.','notice'));
-  const summary=el('section');summary.append(el('h2','Review progress'),el('p',`${page.completed_requirements} of ${page.total_requirements} requirements reviewed`));
-  summary.append(el('p',report?.evaluation_complete?'Automated evaluation complete. Human sign-offs are tracked separately.':'Evaluation is incomplete. Review sign-offs do not resolve evaluation errors or ownership gaps.'));
-  const table=el('table'),head=el('tr');for(const title of ['Reviewer','Parts','Progress','Review'])head.append(el('th',title));
-  const thead=el('thead');thead.append(head);table.append(thead);const tbody=el('tbody');
-  for(const row of page.reviewers){const tr=el('tr');tr.append(el('td',row.owner),el('td',row.parts.join(', ')),el('td',`${row.completed}/${row.indices.length}`));const td=el('td');td.append(link('Open assigned review',row.url));tr.append(td);tbody.append(tr);}table.append(tbody);summary.append(table);app.append(summary);
-  if(!report){if(view.envelope?.setup_failure)app.append(el('p',view.envelope.setup_failure.message,'error'));return;}
-  for(const e of report.errors)app.append(el('p',e.message,'error'));
-  if(report.unowned_files.length)app.append(el('p','Unowned parts: '+report.unowned_files.join(', '),'notice'));
-  const filtered=report.requirements.map((r,index)=>({r,index})).filter(({r})=>r.owners.some(o=>selected?o.toLowerCase()===selected:own.includes(o.toLowerCase())));
-  app.append(el('h2',selected?`Assigned to ${selected}`:'Your assigned parts'));
-  if(selected && !own.includes(selected))app.append(el('p','You can view these assignments, but only an assigned reviewer can mark them reviewed.','notice'));
-  if(!filtered.length)app.append(el('p','No parts are assigned to this reviewer.'));
-  const actionable=filtered.filter(({r})=>(!selected || own.includes(selected)) && r.owners.some(o=>own.includes(o.toLowerCase()))).map(x=>x.index);
-  const save=async(indices:number[],reviewed:boolean)=>{await api('/api/review/decision',{run_id:view.run_id,head:view.identity.head,indices,reviewed});await load_review(view.run_id);};
-  if(actionable.length && page.current && !view.superseded)app.append(button('Mark all my assigned parts reviewed',()=>save(actionable,true)));
-  for(const {r,index} of filtered) {
-    const card=el('article');card.append(el('h2',r.path),el('p',`${r.approval==='All'?'All of':'Any of'} ${r.owners.join(', ')}`),el('p',r.evaluation.result.reason));
-    if(r.evaluation.result.verdict==='Uncertain')card.append(el('p','Uncertain — human review required.','notice'));
-    for(const evidence of r.evaluation.result.evidence)card.append(el('pre',evidence));
-    card.append(link('Open PR files on GitHub',`https://github.com/${view.identity.repository}/pull/${view.identity.pr}/files`));
-    const diff=el('div');card.append(button('Show diff',async()=>{const data=await api<{patch:string|null;message:string}>('/api/review/diff?run='+encodeURIComponent(view.run_id)+'&index='+index);diff.replaceChildren(data.patch?el('pre',data.patch):el('p',data.message));}),diff);
-    const decisions=page.decisions.filter(d=>d.requirement_index===index);
-    for(const d of decisions)card.append(el('p',`Reviewed by @${d.github_login} for ${d.owner} · ${new Date(d.reviewed_at).toLocaleString()}`,'reviewed'));
-    const mine=decisions.some(d=>d.github_user_id===page.reviewer.user_id);
-    if(actionable.includes(index) && page.current && !view.superseded)card.append(button(mine?'Reopen my review':'Mark reviewed',()=>save([index],!mine)));
-    app.append(card);
-  }
-  if(selected)app.append(link('Show my assignments','/?run='+encodeURIComponent(view.run_id)));
-  const delivery=el('section');delivery.append(el('h2','Publication status'));for(const [provider,status] of Object.entries(view.deliveries))delivery.append(el('p',`${provider}: ${status.status}${status.error?' — '+status.error:''}`));app.append(delivery);
+
+function toast(message: string) {
+  const node = document.querySelector<HTMLElement>('#toast')!; node.textContent = message; node.classList.add('visible');
+  setTimeout(() => node.classList.remove('visible'), 4500);
 }
-function input(label:string,placeholder:string){const l=el('label',label);const i=el('input');i.placeholder=placeholder;l.append(i);return {label:l,input:i};}
-function button(text:string,action:()=>Promise<void>){const b=el('button',text);b.onclick=()=>{b.disabled=true;void action().catch(error).finally(()=>b.disabled=false);};return b;}
-async function setup(repository:string){const panel=el('section');panel.append(el('h2','Connect repository'));const state=await api<{stage:string;pr?:{url:string}}>('/api/setup?repository_id='+encodeURIComponent(repository));panel.append(el('p',state.stage.replaceAll('_',' ')));if(state.pr)panel.append(link('View setup PR',state.pr.url));const owners=input('Confirmed GitHub owners','@owner @organization/team');panel.append(owners.label);let preview:unknown=null;panel.append(button('Preview workflow and policy',async()=>{preview=await api('/api/setup',{repository_id:repository,options:{owners:owners.input.value.trim().split(/\s+/),create_pr:false}});panel.append(el('pre',JSON.stringify(preview,null,2)));panel.append(button('Create setup PR',async()=>{await api('/api/setup',{repository_id:repository,options:{owners:owners.input.value.trim().split(/\s+/),create_pr:true}});location.reload();}));}));panel.append(link('Connect Slack workspace','/auth/slack/start?repository_id='+encodeURIComponent(repository)));const channel=input('Slack channel ID','C0123456789'),owner=input('GitHub owner','@owner'),user=input('Verified Slack member ID','U0123456789');panel.append(channel.label,owner.label,user.label,button('Save owner mapping',async()=>{await api('/api/slack/mapping',{repository_id:repository,channel:channel.input.value,owner:owner.input.value,user_id:user.input.value});panel.append(el('p','Mapping saved.'));}));app.append(panel);}
-async function main(){const session=await api<Session>('/api/session');csrf=session.csrf;const q=new URLSearchParams(location.search),run=q.get('run');if(run){await load_review(run);return;}app.replaceChildren(el('h1','Your repositories'));for(const repo of session.repositories){const section=el('section');section.append(el('h2',repo.name));if(repo.latest_run)section.append(link('Latest report','/?run='+encodeURIComponent(repo.latest_run)));if(repo.can_setup)section.append(link('Repository setup','/?repository='+encodeURIComponent(repo.id)));app.append(section);}const selected=q.get('repository');if(selected)await setup(selected);const connect=el('section');connect.append(el('h2','Link a GitHub App installation'),el('p','Install the CodeTurtle GitHub App on selected repositories, then verify your administrator access here.'));const install=input('Installation ID','123456'),repository=input('Repository ID','123456');connect.append(install.label,repository.label,button('Verify with GitHub',async()=>{location.href='/auth/github/start?installation_id='+encodeURIComponent(install.input.value)+'&repository_id='+encodeURIComponent(repository.input.value);}));app.append(connect);}
-void main().catch(error);
+
+function modal(content: string, onSubmit: (data: FormData, dialog: HTMLDialogElement) => void | Promise<void>) {
+  const dialog = document.createElement('dialog');
+  dialog.className = 'codeturtle-dialog'; dialog.innerHTML = `<form>${content}</form>`;
+  document.body.append(dialog);
+  dialog.addEventListener('close', () => dialog.remove());
+  dialog.querySelector('[data-cancel]')?.addEventListener('click', () => dialog.close());
+  dialog.querySelector('form')!.addEventListener('submit', event => { event.preventDefault(); if(busy)return; void Promise.resolve(onSubmit(new FormData(event.target as HTMLFormElement), dialog)).catch(e=>{ let error=dialog.querySelector('.form-error'); if(!error){ error=document.createElement('p');error.className='form-error';dialog.append(error); } error.textContent=String(e instanceof Error?e.message:e); }); });
+  dialog.showModal(); return dialog;
+}
+
+function openComment(line: number, side: Side = 'RIGHT', replyTo: string | null = null) {
+  const file = selected();
+  if (!owns(file) || !page.current) { toast('You can comment on files you own.'); return; }
+  modal(`<div class="modal-eyebrow">DRAFT COMMENT</div><h2>${replyTo ? 'Reply to this thread' : 'Leave a note'}</h2><p>${escape(file.name)} · ${side === 'LEFT' ? 'original' : 'new'} line ${line}</p><label class="field-label" for="comment-body">Comment</label><textarea id="comment-body" name="body" required rows="5" placeholder="What should the author know?" autofocus></textarea><div class="modal-note">This stays private until you submit your review.</div><div class="modal-actions"><button class="button ghost" type="button" data-cancel>Cancel</button><button class="button primary" type="submit">Save draft</button></div>`, async (data, dialog) => {
+    const body = String(data.get('body') || '').trim(); if (!body) return;
+    state.drafts.push({ id: crypto.randomUUID(), file: file.id, revision: state.revision[file.id], user: state.user, line, side, body, replyTo });
+    await saveDrafts(); dialog.close(); render(); toast('Draft saved. It will publish with your review.');
+  });
+}
+
+async function stageDecision(kind: Decision['kind'], body = '') {
+  const file = selected();
+  if (!owns(file) || !page.current) return;
+  state.pendingDecisions = state.pendingDecisions.filter(decision => !(decision.file === file.id && decision.user === state.user));
+  state.pendingDecisions.push({ id: crypto.randomUUID(), file: file.id, user: state.user, revision: state.revision[file.id], kind, body });
+  await saveDrafts(); render();
+}
+
+function rejectFile() {
+  const file = selected();
+  if (!owns(file) || !page.current) return;
+  modal(`<div class="modal-eyebrow">FILE DECISION</div><h2>Reject ${escape(file.name)}</h2><p>Request changes on this file. Other files keep their own decisions.</p><label class="field-label" for="rejection-reason">What needs to change?</label><textarea id="rejection-reason" name="reason" rows="4" required autofocus placeholder="Explain the issue in this file">${escape(myDecision(file)?.kind === 'changes' ? myDecision(file)?.body : '')}</textarea><div class="modal-note">This decision stays private until you submit your review.</div><div class="form-error" role="alert"></div><div class="modal-actions"><button class="button ghost" type="button" data-cancel>Cancel</button><button class="button reject-file" type="submit">Save rejection</button></div>`, async (data, dialog) => {
+    const reason = String(data.get('reason') || '').trim();
+    if (!reason) { dialog.querySelector('.form-error')!.textContent = 'Explain what needs to change in this file.'; return; }
+    await stageDecision('changes', reason); dialog.close();
+  });
+}
+
+function openReview() {
+  if (undecidedFiles().length) { toast('Approve or reject each of your files before submitting.'); return; }
+  const pending = myPendingDecisions();
+  const drafts = myDrafts();
+  if (!pending.length && !drafts.length) return;
+  modal(`<div class="modal-eyebrow">PUBLISH REVIEW</div><h2>Submit your review</h2><p>Publish the decisions you made individually. No other files will be approved.</p><div class="review-decisions">${pending.map(decision => `<div><span>${escape(files.find(file => file.id === decision.file)?.name || decision.file)}</span><strong class="${decision.kind === 'approve' ? 'approved' : 'blocked'}">${decision.kind === 'approve' ? 'Approve' : 'Reject'}</strong>${decision.kind === 'changes' ? `<p>${escape(decision.body)}</p>` : ''}</div>`).join('')}</div><div class="modal-note">${drafts.length} draft ${drafts.length === 1 ? 'comment' : 'comments'} will publish with this review. Return to a file to change its decision.</div><div class="form-error" role="alert"></div><div class="modal-actions"><button class="button ghost" type="button" data-cancel>Back to files</button><button class="button primary" type="submit">Publish review</button></div>`, async (data, dialog) => {
+    const fail = (message: string) => { dialog.querySelector('.form-error')!.textContent = message; };
+    if (undecidedFiles().length) { fail('A file still needs an explicit decision. Return to your files.'); return; }
+    if (pending.some(decision => decision.revision !== state.revision[decision.file]) || drafts.some(draft => draft.revision !== state.revision[draft.file])) { fail('A decision or comment refers to an older revision. Review that file again and discard any outdated comments.'); return; }
+    await publish(); dialog.close(); render(); toast('Review published. The GitHub comment update is queued.');
+  });
+}
+
+function openOverride(user: string) {
+  if (!page.admin) return;
+  const file = selected();
+  const block = fileStatus(file, state).activeBlocks.find(decision => decision.user === user);
+  if (!block) return;
+  modal(`<div class="modal-eyebrow">REPOSITORY ADMIN OVERRIDE</div><h2>Override this block?</h2><p>Clear @${escape(user)}'s changes request on <strong>${escape(file.name)}</strong>.</p><label class="field-label" for="override-reason">Reason for override</label><textarea id="override-reason" name="reason" required minlength="10" rows="4" placeholder="Explain why this can proceed"></textarea><div class="modal-note">Your name and reason will appear in CodeTurtle and the PR comment. Required file sign-offs still apply.</div><div class="modal-actions"><button class="button ghost" type="button" data-cancel>Cancel</button><button class="button warning" type="submit">Confirm override</button></div>`, async (data, dialog) => {
+    const reason = String(data.get('reason') || '').trim(); if (reason.length < 10) return;
+    await overrideBlock(block.id, reason); dialog.close(); render(); toast('Override recorded. Required approvals still apply.');
+  });
+}
+
+app.addEventListener('click', event => { void handleClick(event).catch(e=>toast(e instanceof Error?e.message:String(e))); });
+async function handleClick(event: MouseEvent) {
+  const button = (event.target as Element).closest('button'); if (!button || button.disabled || busy) return;
+  if (button.dataset.tab) { state.tab = button.dataset.tab; render(); return; }
+  if (button.dataset.file) { state.selected = button.dataset.file; await loadContent(selected()); render(); return; }
+  if (button.dataset.override) { openOverride(button.dataset.override); return; }
+  if (button.dataset.removeDraft) { state.drafts = state.drafts.filter(d => d.id !== button.dataset.removeDraft); await saveDrafts(); render(); return; }
+  if (button.dataset.reply) { const comment = state.comments.find(c => c.id === button.dataset.reply)!; openComment(comment.line, comment.side, comment.id); return; }
+  switch (button.dataset.action) {
+    case 'show-all': state.showAll = !state.showAll; if (!state.showAll && !owns(selected())) state.selected = mine()[0]?.id || files[0]?.id || ''; await loadContent(selected()); render(); break;
+    case 'layout': state.split = !state.split; render(); break;
+    case 'comment': openComment(diffEditor?.getModifiedEditor().getPosition()?.lineNumber || 1); break;
+    case 'approve-file': await stageDecision('approve'); break;
+    case 'reject-file': rejectFile(); break;
+    case 'undo-decision': state.pendingDecisions = state.pendingDecisions.filter(decision => !(decision.file === state.selected && decision.user === state.user)); await saveDrafts(); render(); break;
+    case 'submit': openReview(); break;
+  }
+}
+
+async function start() {
+ if (!new URLSearchParams(location.search).has('run')) { await dashboard(); return; }
+ await load();
+ if(!files.length) { app.innerHTML=header()+'<main class="preview-page">No changed files are available in this report.</main>'; return; }
+ await loadContent(selected()); render();
+}
+void start().catch(e=>{ app.replaceChildren();const p=document.createElement('p');p.textContent=e instanceof Error?e.message:String(e);app.append(p);const a=document.createElement('a');a.href='/';a.textContent='Back to repositories';app.append(a); });

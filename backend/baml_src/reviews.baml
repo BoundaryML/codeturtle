@@ -173,40 +173,6 @@ function review_page(
     }
 }
 
-function mark_review(
-    auth: BrowserAuth,
-    req: baml.http.ServerRequest,
-    github: GitHubClient,
-) -> json {
-    let session = auth.session(req, mutation = true);
-    let body = baml.json.parse(req.body);
-    let id = str(body, "run_id");
-    require(matches(id, "^[a-f0-9-]{36}$"), 400, "invalid_run");
-    let run = baml.json.to<StoredRun>(
-        auth.store.rpc("review_run", { "actor": field(session, "actor"), "id": id }),
-    );
-    let reviewer = reviewer_identity(auth, req, run);
-    //# Check GitHub immediately before recording a decision against this immutable report.
-    github.check_current(run.authorized);
-    let indices = baml.json.to<int[]>(field(body, "indices"));
-    let reviewed = baml.json.to<bool>(field(body, "reviewed"));
-    require(indices.length() > 0 && indices.length() <= 1000, 400, "requirements_required");
-    auth.store.rpc(
-        "review_mark",
-        {
-            "id": id,
-            "actor": field(session, "actor"),
-            "head": field(body, "head"),
-            "base": run.authorized.identity.base,
-            "indices": baml.json.from(indices),
-            "reviewed": reviewed,
-            "github_user_id": reviewer.user_id,
-            "github_login": reviewer.login,
-            "eligible_owners": baml.json.from(reviewer.eligible_owners),
-        },
-    )
-}
-
 test "Reviewer rows group parts and retain independent All requirements" {
     let report: json = {
         "requirements": [

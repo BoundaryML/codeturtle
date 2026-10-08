@@ -119,6 +119,24 @@ class ReportService {
                     },
                 );
             }
+            if (route == "/api/workspace" && req.method == "GET") {
+                return response(200, workspace_get(browser, req, self.github));
+            }
+            if (route == "/api/workspace" && req.method == "POST") {
+                return response(200, workspace_write(browser, req, self.github));
+            }
+            if (route == "/api/workspace/content" && req.method == "GET") {
+                return response(200, workspace_content(browser, req, self.github));
+            }
+            if (route == "/api/workspace/state" && req.method == "GET") {
+                let actor = field(browser.session(req), "actor");
+                let id = query(req.url).get("run") ?? "";
+                let run = baml.json.to<StoredRun>(
+                    browser.store.rpc("review_run", { "actor": actor, "id": id }),
+                );
+                let _ = browser.authorize(req, run.authorized.identity.repository_id);
+                return response(200, browser.store.rpc("workspace", { "actor": actor, "id": id }));
+            }
             if (route == "/api/review" && req.method == "GET") {
                 return response(200, review_page(browser, req, self.github));
             }
@@ -126,7 +144,7 @@ class ReportService {
                 return response(200, review_diff(browser, req, self.github));
             }
             if (route == "/api/review/decision" && req.method == "POST") {
-                return response(200, mark_review(browser, req, self.github));
+                return response(410, { "error": "use_workspace_submit" });
             }
             if (route == "/api/slack/mapping" && req.method == "POST") {
                 let body = baml.json.parse(req.body);
@@ -160,7 +178,13 @@ class ReportService {
                 }
             }
         }
-        if (req.method == "GET" && ["/", "/main.js", "/style.css"].includes(route)) {
+        if (
+            req.method == "GET"
+                && (
+                    ["/", "/codeturtle.svg"].includes(route)
+                        || matches(route, "^/assets/[A-Za-z0-9_.-]+\\.(js|css|woff2?|ttf)$")
+                )
+        ) {
             let file = if (route == "/") {
                 "index.html"
             } else {
@@ -168,21 +192,35 @@ class ReportService {
             };
             let mime = if (route == "/") {
                 "text/html"
-            } else if (route == "/main.js") {
+            } else if (route.ends_with(".js")) {
                 "text/javascript"
             } else {
-                "text/css"
+                if (route.ends_with(".css")) {
+                    "text/css"
+                } else if (route.ends_with(".svg")) {
+                    "image/svg+xml"
+                } else if (route.ends_with(".woff2")) {
+                    "font/woff2"
+                } else if (route.ends_with(".woff")) {
+                    "font/woff"
+                } else {
+                    "font/ttf"
+                }
             };
             return baml.http.Response.new(
                 200,
                 {
                     "content-type": mime,
-                    "content-security-policy": "default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+                    "content-security-policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
                     "x-content-type-options": "nosniff",
                     "referrer-policy": "no-referrer",
                     "cache-control": "no-store",
                 },
-                baml.fs.read(config("CODETURTLE_FRONTEND_DIR") + "/" + file).to_utf8(),
+                {
+                    let asset = baml.fs.open(config("CODETURTLE_FRONTEND_DIR") + "/" + file, "r");
+                    defer { asset.close(); }
+                    asset.bytes()
+                },
             );
         }
         if (req.method == "GET" && req.url == "/healthz") {
@@ -231,10 +269,15 @@ class ReportService {
         let result = {
             self.github.check_current(run.authorized);
             if (destination == "github") {
+                let browser = self.browser;
+                if (browser != null && run.envelope?.report != null) {
+                    let _ = workspace_snapshot(browser, null, run, self.github);
+                }
                 baml.json.from(
                     self.github.upsert_pr_comment(
                         run,
                         self.origin,
+                        events = baml.json.to<json[]>(self.store.rpc("workspace_public", { "id": run.id })),
                         decisions = baml.json.to<ReviewDecision[]>(
                             self.store.rpc("review_decisions", { "id": run.id }),
                         ),
