@@ -24,6 +24,34 @@ npm --prefix frontend ci
 npm --prefix frontend run build
 ```
 
+## Test CodeTurtle on this repository
+
+The setup owner and initial reviewer is [@ATX24](https://github.com/ATX24).
+The root [CODETURTLE.md](CODETURTLE.md) assigns every changed file to `@ATX24`.
+
+The [CodeTurtle workflow](.github/workflows/codeturtle.yml) is part of this
+repository's [GitHub Actions suite](https://github.com/BoundaryML/codeturtle/actions/workflows/codeturtle.yml).
+It runs when a pull request is opened, updated, reopened, edited, or marked ready
+for review. It uses the policy from the PR's base revision and a pinned CLI.
+
+To test the complete review flow:
+
+1. Open a small PR against `main` in `BoundaryML/codeturtle` and wait for the
+   **CodeTurtle** Actions run to finish.
+2. Find the bot comment with the reviewer table. The `@ATX24` row should list the
+   changed parts and a personal review link.
+3. Open that link, sign in to [CodeTurtle](https://boundary-codeturtle-staging.fly.dev/),
+   and use the linked GitHub identity `ATX24`.
+4. Inspect each assigned file's diff. Choose **Approve** or **Reject** for every
+   file; a rejection requires a reason. Optional inline comments stay private
+   until submission.
+5. Click **Submit review**, reload the review page, and confirm the published
+   decisions persist and the PR comment updates your progress.
+
+This setup PR provides a small documentation diff for that manual test. Review
+submission is performed by `@ATX24`; it does not submit a native GitHub approval
+or merge the PR.
+
 The GitHub Action lives at `owner/repo/cli@full-commit-SHA`.
 Build the service image from this directory using `backend/Dockerfile`.
 The backend reads the shared report model from `cli/baml_src/models.baml`.
