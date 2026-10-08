@@ -145,7 +145,7 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
         if url.endswith('/access_tokens'):return {'token':'installation'}
         if url.endswith('/repos/acme/repo'):return {'id':42,'permissions':{'admin':True,'pull':True},'default_branch':'main'}
         if '/contents/' in url:return {'sha':'c'*40,'encoding':'base64','size':6,'content':__import__('base64').b64encode(('before\n' if url.endswith(cls.base) else 'after\n').encode()).decode()}
-        if '/actions/runs/' in url:return {'id':123,'run_attempt':1,'event':'pull_request_target','head_sha':cls.base,'path':'.github/workflows/codeturtle.yml','status':'in_progress','pull_requests':[{'number':7,'base':{'repo':{'id':42}}}]}
+        if '/actions/runs/' in url:return {'id':123,'run_attempt':1,'event':'pull_request_target','head_sha':cls.run_head,'path':'.github/workflows/codeturtle.yml','status':'in_progress','pull_requests':[{'number':7,'base':{'repo':{'id':42}}}]}
         if url.endswith('/pulls/7'):return {'state':'open','head':{'sha':cls.live_head},'base':{'sha':cls.base,'ref':'main','repo':{'id':42}},'title':'Test PR'}
         if '/compare/' in url:return {'merge_base_commit':{'sha':cls.base}}
         if '/comments?' in url:return cls.comments
@@ -159,13 +159,21 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
     def setUp(self):
         self.sql('TRUNCATE codeturtle_private.deliveries,codeturtle_private.runs,codeturtle_private.enrollments,codeturtle_private.memberships,codeturtle_private.setups CASCADE')
         literal=json.dumps(self.enrollment).replace("'","''");self.sql("INSERT INTO codeturtle_private.enrollments VALUES('42','"+literal+"')")
-        type(self).comments=[];type(self).posts=0;type(self).fail_post=False;type(self).provider_down=False;type(self).live_head=self.head
+        type(self).comments=[];type(self).posts=0;type(self).fail_post=False;type(self).provider_down=False;type(self).live_head=self.head;type(self).run_head=self.head
     def request(self,path,token='',body=None,method=None,headers=None):
         raw=body if isinstance(body,bytes) else json.dumps(body).encode() if body is not None else None
         req=urllib.request.Request(self.origin+path,data=raw,method=method,headers={'Authorization':'Bearer '+token,'Content-Type':'application/json',**(headers or {})})
         try:
             with urllib.request.urlopen(req,timeout=20) as r:return r.status,json.load(r)
         except urllib.error.HTTPError as e:return e.code,json.load(e)
+    def test_run_metadata_uses_pr_head_while_oidc_uses_trusted_base(self):
+        status,body=self.request('/v1/runs',jwt.encode(self.claims(),self.pem,algorithm='RS256',headers={'kid':'test'}),self.identity)
+        self.assertEqual(status,200,body)
+        type(self).run_head=self.base
+        status,body=self.request('/v1/runs',jwt.encode(self.claims(),self.pem,algorithm='RS256',headers={'kid':'test'}),self.identity)
+        self.assertEqual(status,403,body)
+        self.assertEqual(body['error'],'run_mismatch')
+
     def register(self,claims=None):
         token=jwt.encode(claims or self.claims(),self.pem,algorithm='RS256',headers={'kid':'test'})
         status,data=self.request('/v1/runs',token,self.identity)

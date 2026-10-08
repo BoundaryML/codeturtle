@@ -58,7 +58,7 @@ class GitHubClient {
             num(run, "id").to_string() == i.run_id
                 && num(run, "run_attempt") == i.run_attempt
                 && str(run, "event") == "pull_request_target"
-                && str(run, "head_sha") == i.base
+                && str(run, "head_sha") == i.head
                 && str(run, "path") == workflow_path
                 && str(run, "status") == "in_progress",
             403,
