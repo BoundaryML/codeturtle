@@ -15,6 +15,10 @@ cli/       BAML policy engine, Python Git adapter and reporting transport,
 
 [CLI usage and policy reference](cli/README.md) · [Service configuration and deployment](backend/README.md)
 
+[BAML execution tracing and Studio setup](backend/STUDIO.md): start the service
+with `sh backend/start.sh`, then inspect same-machine recordings with
+`sh backend/traces.sh`.
+
 Install Python 3.10+, Git and BAML **0.20.2-nightly.20261004.a**, then:
 
 ```sh

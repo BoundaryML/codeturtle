@@ -10,6 +10,13 @@ kill_timeout = "30s"
   BAML_RUNTIME_SHA256 = "f04ac48a55c52a97c3b8ace0db0d0da351d85ab6f9bb14e79ebab817a7b5777c"
 [env]
   CODETURTLE_WORKOS_ORGANIZATION_ID = "org_01M4BZY7404YX3KCPGSW46QA24"
+  BAML_TELEMETRY = "medium"
+  BOUNDARY_API_KEY = "local"
+# Provision this volume in ord and give its root to uid/gid 10001 before rollout.
+# Keep recordings, CAS blobs and the derived query index together across releases.
+[[mounts]]
+  source = "codeturtle_traces"
+  destination = "/app/backend/.baml"
 [http_service]
   internal_port = 8080
   force_https = true

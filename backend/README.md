@@ -41,10 +41,14 @@ Install `backend/requirements.txt` in a Python virtual environment. Build the UI
 with `npm ci && npm run build` inside `frontend/`. Start from `backend/`:
 
 ```sh
-baml --agent-skill-check off run main -- --addr 0.0.0.0:8080
+sh start.sh
 ```
 
 Set these **CodeTurtle-specific** environment variables:
+
+The launcher records execution locally for Studio experiments. See
+[execution tracing](STUDIO.md) for queries, volume provisioning, and the separate
+full Studio server requirements. Set `BAML_TELEMETRY=off` to disable recording.
 
 | Variable | Value |
 | --- | --- |

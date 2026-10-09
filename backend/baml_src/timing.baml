@@ -21,7 +21,7 @@ class TimedStore {
         function rpc(self, name: string, payload: json) -> json {
             let start = baml.time.Instant.now();
             defer { self.timing.record("db", start); }
-            self.inner.rpc(name, payload)
+            self.inner.rpc(name, payload, $trace = service_trace("database"))
         }
     }
 }
@@ -32,7 +32,7 @@ class TimedTransport {
         function send(self, method: string, url: string, token: string, payload: json) -> json {
             let start = baml.time.Instant.now();
             defer { self.timing.record("provider", start); }
-            self.inner.send(method, url, token, payload)
+            self.inner.send(method, url, token, payload, $trace = service_trace("provider"))
         }
     }
 }

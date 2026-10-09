@@ -414,7 +414,7 @@ function main(addr: string = "0.0.0.0:8080") -> never {
     };
     baml.http.Server.bind(addr).serve(
         (req) -> {
-            app.handle(req)
+            app.handle(req, $trace = service_trace("request"))
         },
         max_body_size = 4194304,
         max_connections = 16,
