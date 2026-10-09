@@ -94,6 +94,10 @@ function reviewer_identity(
 ) -> ReviewIdentity {
     let repository_id = run.authorized.identity.repository_id;
     let token = auth.repository_access(actor, repository_id);
+    reviewer_with_token(auth, run, token)
+}
+
+function reviewer_with_token(auth: BrowserAuth, run: StoredRun, token: string) -> ReviewIdentity {
     let user = auth.http.send("GET", "https://api.github.com/user", token, null);
     let login = str(user, "login").to_lower_case();
     let eligible = ["@" + login];

@@ -57,7 +57,14 @@ class ReportService {
         )
     }
     function handle(self, req: baml.http.ServerRequest) -> baml.http.Response {
-        self.route(req) catch_all (error, context) {
+        let started = baml.time.Instant.now();
+        let timing = RequestTiming {gate:(baml.spawn.Limit.new(1) catch_all (_) { _ => baml.sys.panic("Invalid timing limit") }), durations:{}, counts:{}};
+        let store = TimedStore {inner:self.store, timing:timing};
+        let http = TimedTransport {inner:self.github.http, timing:timing};
+        let github = GitHubClient {...self.github, http:http};
+        let browser = if let auth: BrowserAuth = self.browser { BrowserAuth {...auth, store:store, http:TimedTransport {inner:auth.http,timing:timing}} } else {null};
+        let request = ReportService {...self, store:store, github:github, browser:browser};
+        let result = request.route(req) catch_all (error, context) {
             let e: ApiError => response(e.status, { "error": e.code }),
             baml.json.ParseError | baml.json.DecodeError => {
                 response(400, { "error": "invalid_json" })
@@ -66,14 +73,19 @@ class ReportService {
                 log.error("Request failed at " + context.stack_trace.to_string());
                 response(503, { "error": "service_unavailable" })
             },
-        }
+        };
+        result.headers["server-timing"] = "total;dur=" + started.elapsed().to_milliseconds().to_string() + ", " + timing.header();
+        result
     }
     function route(self, req: baml.http.ServerRequest) -> baml.http.Response {
         require(req.body.to_utf8().length() <= 4194304, 413, "payload_too_large");
         require(!req.body.includes("�"), 400, "invalid_utf8");
         let route = req.url.split("?")[0];
         if (route == "/webhooks/github" && req.method == "POST") {
-            return receive_webhook(req, self.store, config("CODETURTLE_GITHUB_WEBHOOK_SECRET"));
+            let result = receive_webhook(req, self.store, config("CODETURTLE_GITHUB_WEBHOOK_SECRET"));
+            let event = req.headers.get("x-github-event") ?? "";
+            if (event == "installation" || event == "installation_repositories") { self.github.tokens.clear(); }
+            return result;
         }
         if let browser: BrowserAuth = self.browser {
             if (route == "/auth/login" && req.method == "GET") {
@@ -132,13 +144,10 @@ class ReportService {
                 return response(200, workspace_content(browser, req, self.github));
             }
             if (route == "/api/workspace/state" && req.method == "GET") {
-                let actor = field(browser.session(req), "actor");
-                let id = query(req.url).get("run") ?? "";
-                let run = baml.json.to<StoredRun>(
-                    browser.store.rpc("review_run", { "actor": actor, "id": id }),
-                );
-                let _ = browser.authorize(req, run.authorized.identity.repository_id);
-                return response(200, browser.store.rpc("workspace", { "actor": actor, "id": id }));
+                return response(200, workspace_state(browser, req));
+            }
+            if (route == "/api/workspace/comments" && req.method == "GET") {
+                return response(200, workspace_comments(browser, req));
             }
             if (route == "/api/review" && req.method == "GET") {
                 return response(200, review_page(browser, req, self.github));
@@ -278,7 +287,11 @@ class ReportService {
             if (destination == "github") {
                 let browser = self.browser;
                 if (browser != null && run.envelope?.report != null) {
-                    let _ = workspace_snapshot(browser, null, run, self.github);
+                    let files = baml.json.to<json[]>(workspace_snapshot(browser, null, run, self.github));
+                    // Bounded warming before the review link is published; failure is non-fatal.
+                    for (let file in files.slice(0, 2)) {
+                        workspace_file(self.github, run, file) catch_all (_) { _ => null };
+                    }
                 }
                 baml.json.from(
                     self.github.upsert_pr_comment(
@@ -357,6 +370,8 @@ function service() -> ReportService {
         app_id: config("CODETURTLE_GITHUB_APP_ID"),
         private_key: config("CODETURTLE_GITHUB_PRIVATE_KEY"),
         bot_id: baml.Int.parse(config("CODETURTLE_GITHUB_BOT_ID")),
+        tokens: bounded_cache(262144),
+        contents: bounded_cache(16777216),
     };
     let secrets = SecretBox { key: uint8array.from_hex(config("CODETURTLE_ENCRYPTION_KEY")) };
     let browser = BrowserAuth {

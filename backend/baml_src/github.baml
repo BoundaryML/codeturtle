@@ -4,28 +4,24 @@ class GitHubClient {
     app_id: string,
     private_key: string,
     bot_id: int,
+    tokens: BoundedCache,
+    contents: BoundedCache,
     function installation_token(self, e: Enrollment, write: bool = false) -> string {
         require(e.active, 403, "installation_inactive");
-        let jwt = self.crypto.sign(self.app_id, self.private_key);
-        let permissions: json = {
-            "contents": "read",
-            "actions": "read",
-            "pull_requests": if (write) {
-                "write"
-            } else {
-                "read"
-            },
-        };
-        str(
-            self.http.send(
-                "POST",
-                `https://api.github.com/app/installations/${e.installation_id}/access_tokens`,
-                jwt,
-                { "repository_ids": [baml.Int.parse(e.repository_id)], "permissions": permissions },
-            ),
-            "token",
-        )
+        let key = baml.json.stringify({"tenant": e.tenant_id, "installation": e.installation_id, "repository": e.repository_id, "write": write});
+        let data = self.tokens.get(key, 3000, () -> {
+            let jwt = self.crypto.sign(self.app_id, self.private_key);
+            let result = self.http.send("POST", `https://api.github.com/app/installations/${e.installation_id}/access_tokens`, jwt,
+                {"repository_ids": [baml.Int.parse(e.repository_id)], "permissions": {"contents":"read", "actions":"read", "pull_requests": if (write) {"write"} else {"read"}}});
+            // GitHub installation tokens last one hour; reject unexpectedly short-lived responses.
+            if let expiry: string = baml.json.to<string?>(field(result, "expires_at")) {
+                require((baml.time.Instant.parse(expiry) - baml.time.Instant.now()).to_seconds() > 3060n, 503, "short_lived_installation_token");
+            }
+            result
+        });
+        str(data, "token")
     }
+
     function api(
         self,
         method: string,
@@ -34,7 +30,9 @@ class GitHubClient {
         token: string,
         body: json = null,
     ) -> json {
-        self.http.send(method, "https://api.github.com/repos/" + repository + path, token, body)
+        self.http.send(method, "https://api.github.com/repos/" + repository + path, token, body) catch (e) {
+            let error: ApiError => { self.tokens.clear(); throw error; }
+        }
     }
     function authorize(self, i: RunIdentity, claims: json, e: Enrollment) -> AuthorizedRun {
         require(

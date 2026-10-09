@@ -44,6 +44,8 @@ class ServiceTests(unittest.TestCase):
         if not review_sql_path: raise RuntimeError('Set CODETURTLE_TEST_REVIEW_SQL to the reviewer SQL update')
         update=Path(review_sql_path).read_text().split('```sql\n')[1].split('```')[0]
         cls.sql(update);cls.sql(update)
+        performance=(ROOT/"backend/migrations/003_workspace_performance.sql").read_text()
+        cls.sql(performance);cls.sql(performance)
         cls.key=rsa.generate_private_key(public_exponent=65537,key_size=2048)
         cls.pem=cls.key.private_bytes(serialization.Encoding.PEM,serialization.PrivateFormat.PKCS8,serialization.NoEncryption()).decode()
         cls.jwk=json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(cls.key.public_key()));cls.jwk['kid']='test'
@@ -72,7 +74,9 @@ class ServiceTests(unittest.TestCase):
                         result=outer.rpc(name,data['p']);self.send_json(200,result)
                     elif self.path=='/provider':self.send_json(200,outer.provider(data))
                     else:self.send_json(404,{})
-                except Exception:self.send_json(503,{'error':'fixture_failure'})
+                except Exception as error:
+                    if isinstance(error,subprocess.CalledProcessError): print(error.stderr,flush=True)
+                    self.send_json(503,{'error':'fixture_failure'})
             def send_json(self,status,data):
                 body=json.dumps(data).encode();self.send_response(status);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
         cls.mock=ThreadingHTTPServer(('127.0.0.1',0),Handler);cls.addClassCleanup(cls.mock.server_close);cls.addClassCleanup(cls.mock.shutdown)
@@ -83,12 +87,12 @@ class ServiceTests(unittest.TestCase):
         fixture='''class FixtureTransport { url: string, implements Transport { function send(self, method: string, url: string, token: string, payload: json) -> json { let r = baml.http.send(baml.http.Request.from_url(self.url + "/provider").set_method("POST").set_body(baml.json.stringify({"method": method, "url": url, "token": token, "payload": payload}))); require(r.status_code == 200, 503, "fixture_provider_unavailable"); baml.json.parse(r.text()) } } }
 function test_main(addr: string, fixture_url: string, python: string, crypto_path: string, models_path: string, key_path: string, origin: string) -> never {
  let http = FixtureTransport {url: fixture_url}; let crypto = CryptoHelper {python: python, path: crypto_path};
- let app = ReportService {store: SupabaseStore {url: fixture_url, key: "fixture"}, github: GitHubClient {http: http, crypto: crypto, app_id: "test", private_key: baml.fs.read(key_path), bot_id: 999}, oidc: GitHubOIDC {http: http, crypto: crypto, audience: origin}, parser: report_parser(models_path), origin: origin, slack: SlackClient {http: http, secrets: SecretBox {key: uint8array.zeroes(32)}}, browser: BrowserAuth {store: SupabaseStore {url: fixture_url, key: "fixture"}, http: http, origin: origin, client_id: "test", client_secret: "test", organization_id: "tenant", secrets: SecretBox {key: uint8array.zeroes(32)}}, onboarding: null};
+ let app = ReportService {store: SupabaseStore {url: fixture_url, key: "fixture"}, github: GitHubClient {http: http, crypto: crypto, app_id: "test", private_key: baml.fs.read(key_path), bot_id: 999, tokens: bounded_cache(262144), contents: bounded_cache(16777216)}, oidc: GitHubOIDC {http: http, crypto: crypto, audience: origin}, parser: report_parser(models_path), origin: origin, slack: SlackClient {http: http, secrets: SecretBox {key: uint8array.zeroes(32)}}, browser: BrowserAuth {store: SupabaseStore {url: fixture_url, key: "fixture"}, http: http, origin: origin, client_id: "test", client_secret: "test", organization_id: "tenant", secrets: SecretBox {key: uint8array.zeroes(32)}}, onboarding: null};
  baml.http.Server.bind(addr).serve((req) -> {app.handle(req)}, max_body_size = 4194304)
 }
 function test_delivery(fixture_url: string, python: string, crypto_path: string, models_path: string, key_path: string, origin: string) -> void {
  let http = FixtureTransport {url: fixture_url}; let crypto = CryptoHelper {python: python, path: crypto_path};
- let app = ReportService {store: SupabaseStore {url: fixture_url, key: "fixture"}, github: GitHubClient {http: http, crypto: crypto, app_id: "test", private_key: baml.fs.read(key_path), bot_id: 999}, oidc: GitHubOIDC {http: http, crypto: crypto, audience: origin}, parser: report_parser(models_path), origin: origin, slack: SlackClient {http: http, secrets: SecretBox {key: uint8array.zeroes(32)}}, browser: BrowserAuth {store: SupabaseStore {url: fixture_url, key: "fixture"}, http: http, origin: origin, client_id: "test", client_secret: "test", organization_id: "tenant", secrets: SecretBox {key: uint8array.zeroes(32)}}, onboarding: null}; app.deliver_once()
+ let app = ReportService {store: SupabaseStore {url: fixture_url, key: "fixture"}, github: GitHubClient {http: http, crypto: crypto, app_id: "test", private_key: baml.fs.read(key_path), bot_id: 999, tokens: bounded_cache(262144), contents: bounded_cache(16777216)}, oidc: GitHubOIDC {http: http, crypto: crypto, audience: origin}, parser: report_parser(models_path), origin: origin, slack: SlackClient {http: http, secrets: SecretBox {key: uint8array.zeroes(32)}}, browser: BrowserAuth {store: SupabaseStore {url: fixture_url, key: "fixture"}, http: http, origin: origin, client_id: "test", client_secret: "test", organization_id: "tenant", secrets: SecretBox {key: uint8array.zeroes(32)}}, onboarding: null}; app.deliver_once()
 }'''
         (cls.project/'baml_src/fixture.baml').write_text(fixture)
         cls.env=dict(os.environ,BAML_VERSION='0.20.2-nightly.20261004.a',CODETURTLE_FRONTEND_DIR=str(ROOT/'frontend/dist'),CODETURTLE_GITHUB_CLIENT_ID='test',CODETURTLE_GITHUB_CLIENT_SECRET='test')
@@ -131,6 +135,7 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
     def provider(cls,data):
         if cls.provider_down:raise ValueError()
         url=data['url'];method=data['method']
+        cls.provider_calls.append((method,url))
         if url == 'https://api.workos.com/user_management/authenticate':
             result = {'user':{'id':'workos-user','email_verified':data['payload']['code']!='unverified'},'organization_id':'tenant'}
             if data['payload']['code']=='missing-org': result.pop('organization_id')
@@ -159,7 +164,7 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
     def setUp(self):
         self.sql('TRUNCATE codeturtle_private.deliveries,codeturtle_private.runs,codeturtle_private.enrollments,codeturtle_private.memberships,codeturtle_private.setups CASCADE')
         literal=json.dumps(self.enrollment).replace("'","''");self.sql("INSERT INTO codeturtle_private.enrollments VALUES('42','"+literal+"')")
-        type(self).comments=[];type(self).posts=0;type(self).fail_post=False;type(self).provider_down=False;type(self).live_head=self.head;type(self).run_head=self.head
+        type(self).provider_calls=[];type(self).comments=[];type(self).posts=0;type(self).fail_post=False;type(self).provider_down=False;type(self).live_head=self.head;type(self).run_head=self.head
     def request(self,path,token='',body=None,method=None,headers=None):
         raw=body if isinstance(body,bytes) else json.dumps(body).encode() if body is not None else None
         req=urllib.request.Request(self.origin+path,data=raw,method=method,headers={'Authorization':'Bearer '+token,'Content-Type':'application/json',**(headers or {})})
@@ -517,5 +522,93 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
         status,headers,_=self.auth_request('/auth/callback?state='+state+'&code=valid',cookie)
         self.assertEqual(status,302);self.assertEqual(headers['location'],target)
 
+
+
+    def operation_fixture(self):
+        g,h,a,b=self.workspace_fixture()
+        d=b['draft']['decisions'][0]
+        item={'id':str(uuid.uuid4()),'file':'a.txt','user':'one','revision':d['revision'],'side':'RIGHT','line':1,'body':'hello','replyTo':None}
+        return g,h,a,dict(b,action='operation',operation_id=str(uuid.uuid4()),expected_version=0,operation={'kind':'upsert_comment','item':item})
+
+    def test_operation_retry_conflict_and_private_pagination(self):
+        g,h,a,b=self.operation_fixture()
+        first=self.request('/api/workspace',body=b,headers=h)
+        self.assertEqual(first[0],200,first);self.assertEqual(first[1]['version'],1)
+        self.assertEqual(self.request('/api/workspace',body=b,headers=h),first)
+        altered=dict(b,operation=dict(b['operation'],item=dict(b['operation']['item'],body='changed')))
+        self.assertEqual(self.request('/api/workspace',body=altered,headers=h)[0],409)
+        other=dict(b,operation_id=str(uuid.uuid4()))
+        self.assertEqual(self.request('/api/workspace',body=other,headers=h)[0],409)
+        state=self.request('/api/workspace/state?run='+g['run_id'],headers=h)[1]
+        self.assertEqual(len(state['draft']['comments']),1)
+        comments=self.request('/api/workspace/comments?run='+g['run_id']+'&file=a.txt',headers=h)[1]
+        self.assertEqual(comments['events'],[])
+        other_h,_=self.reviewer_session('other')
+        self.assertEqual(self.request('/api/workspace/state?run='+g['run_id'],headers=other_h)[1]['draft']['comments'],[])
+
+    def test_operations_validate_assignment_csrf_and_submission_head(self):
+        g,h,a,b=self.operation_fixture()
+        self.assertEqual(self.request('/api/workspace',body=b)[0],401)
+        self.assertEqual(self.request('/api/workspace',body=b,headers={'Cookie':h['Cookie']})[0],403)
+        bad=dict(b,operation=dict(b['operation'],item=dict(b['operation']['item'],user='spoof')))
+        self.assertEqual(self.request('/api/workspace',body=bad,headers=h)[0],403)
+        type(self).live_head='f'*40
+        self.assertEqual(self.request('/api/workspace',body=b,headers=h)[0],200)
+        self.assertEqual(self.request('/api/workspace',body=dict(b,action='submit'),headers=h)[0],409)
+        self.sql("UPDATE codeturtle_private.enrollments SET config=jsonb_set(config,'{active}','false')")
+        self.assertEqual(self.request('/api/workspace',body=b,headers=h)[0],403)
+
+    def test_legacy_writer_invalidates_operation_version(self):
+        g,h,a,b=self.operation_fixture()
+        draft={'decisions':[],'comments':[b['operation']['item']]}
+        self.assertEqual(self.request('/api/workspace',body=dict(b,action='draft',draft=draft),headers=h)[0],200)
+        self.assertEqual(self.request('/api/workspace',body=b,headers=h)[0],409)
+
+    def test_submit_detects_intervening_tab_write(self):
+        g,h,a,b=self.operation_fixture()
+        decision=dict(b,operation={'kind':'upsert_decision','item':b['draft']['decisions'][0]})
+        self.assertEqual(self.request('/api/workspace',body=decision,headers=h)[0],200)
+        comment=dict(b,operation_id=str(uuid.uuid4()),expected_version=1)
+        self.assertEqual(self.request('/api/workspace',body=comment,headers=h)[0],200)
+        stale=dict(b,action='submit',expected_version=1)
+        self.assertEqual(self.request('/api/workspace',body=stale,headers=h)[0],409)
+        self.assertEqual(self.sql("SELECT count(*) FROM codeturtle_private.review_events"),'0')
+        self.assertEqual(self.request('/api/workspace',body=dict(stale,expected_version=2),headers=h)[0],200)
+
+    def test_warm_workspace_and_draft_call_budgets(self):
+        g,h,a,b=self.operation_fixture()
+        type(self).provider_calls=[]
+        req=urllib.request.Request(self.origin+'/api/workspace?run='+g['run_id'],headers=h)
+        with urllib.request.urlopen(req) as response:
+            self.assertEqual(response.status,200)
+            self.assertRegex(response.headers['server-timing'],r'db;dur=\d+;desc="2 calls"')
+            json.load(response)
+        self.assertEqual(len(self.provider_calls),3,self.provider_calls)
+        type(self).provider_calls=[]
+        self.assertEqual(self.request('/api/workspace',body=b,headers=h)[0],200)
+        self.assertEqual(len(self.provider_calls),2,self.provider_calls)
+        self.assertFalse(any('/pulls/' in url or '/access_tokens' in url for _,url in self.provider_calls))
+
+    def test_cached_content_still_checks_access(self):
+        g,h,a,b=self.workspace_fixture()
+        path='/api/workspace/content?run='+g['run_id']+'&file=a.txt'
+        self.assertEqual(self.request(path,headers=h)[0],200)
+        type(self).provider_calls=[]
+        self.assertEqual(self.request(path,headers=h)[0],200)
+        self.assertFalse(any('/contents/' in u or '/access_tokens' in u for _,u in self.provider_calls))
+        self.assertTrue(any('/repos/acme/repo' == u.removeprefix('https://api.github.com') for _,u in self.provider_calls))
+        self.sql("UPDATE codeturtle_private.enrollments SET config=jsonb_set(config,'{active}','false')")
+        self.assertEqual(self.request(path,headers=h)[0],403)
+
+    def test_comments_cursor_and_compact_bootstrap(self):
+        g,h,a,b=self.workspace_fixture()
+        literal=json.dumps({'id':'comment','file':'a.txt','user':'one','revision':'revision','line':1,'side':'RIGHT','body':'published','replyTo':None}).replace("'","''")
+        self.sql("INSERT INTO codeturtle_private.review_events(run_id,user_id,github_user_id,kind,data) SELECT '"+g['run_id']+"','reviewer','1','comment','"+literal+"'::jsonb FROM generate_series(1,55)")
+        page=self.request('/api/workspace?run='+g['run_id'],headers=h)[1]
+        self.assertEqual(page['csrf'],'csrf');self.assertEqual(page['state']['events'],[])
+        path='/api/workspace/comments?run='+g['run_id']+'&file=a.txt'
+        first=self.request(path,headers=h)[1];self.assertEqual(len(first['events']),50);self.assertTrue(first['more'])
+        second=self.request(path+'&after='+str(first['cursor']),headers=h)[1];self.assertEqual(len(second['events']),5);self.assertFalse(second['more'])
+        self.assertLess(first['events'][-1]['seq'],second['events'][0]['seq'])
 
 if __name__=='__main__':unittest.main()
