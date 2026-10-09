@@ -92,7 +92,7 @@ function workspace_get(
     let id = query(req.url).get("run") ?? "";
     require(matches(id, "^[a-f0-9-]{36}$"), 400, "invalid_run");
     let run = baml.json.to<StoredRun>(auth.store.rpc("review_run", { "actor": actor, "id": id }));
-    let reviewer = reviewer_identity(auth, req, run);
+    let reviewer = reviewer_identity(auth, req, run, baml.json.to<Actor>(actor));
     let files = workspace_snapshot(auth, actor, run, github);
     let current = {
         github.check_current(run.authorized);
@@ -144,7 +144,7 @@ function workspace_write(
     let id = str(body, "run_id");
     require(matches(id, "^[a-f0-9-]{36}$"), 400, "invalid_run");
     let run = baml.json.to<StoredRun>(auth.store.rpc("review_run", { "actor": actor, "id": id }));
-    let reviewer = reviewer_identity(auth, req, run);
+    let reviewer = reviewer_identity(auth, req, run, baml.json.to<Actor>(actor));
     if (field(body, "action") == "override") {
         let _ = auth.authorize(req, run.authorized.identity.repository_id, setup = true);
     }

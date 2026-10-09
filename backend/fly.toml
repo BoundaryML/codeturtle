@@ -25,4 +25,5 @@ kill_timeout = "30s"
 [[vm]]
   cpu_kind = "shared"
   cpus = 1
-  memory = "512mb"
+  # Leave room for the BAML runtime, concurrent requests, and signing subprocesses.
+  memory = "1gb"

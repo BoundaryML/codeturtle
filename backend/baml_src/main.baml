@@ -57,12 +57,15 @@ class ReportService {
         )
     }
     function handle(self, req: baml.http.ServerRequest) -> baml.http.Response {
-        self.route(req) catch_all (error) {
+        self.route(req) catch_all (error, context) {
             let e: ApiError => response(e.status, { "error": e.code }),
             baml.json.ParseError | baml.json.DecodeError => {
                 response(400, { "error": "invalid_json" })
             },
-            _ => response(503, { "error": "service_unavailable" }),
+            _ => {
+                log.error("Request failed at " + context.stack_trace.to_string());
+                response(503, { "error": "service_unavailable" })
+            },
         }
     }
     function route(self, req: baml.http.ServerRequest) -> baml.http.Response {
@@ -395,7 +398,7 @@ function main(addr: string = "0.0.0.0:8080") -> never {
             app.handle(req)
         },
         max_body_size = 4194304,
-        max_connections = 64,
+        max_connections = 16,
         header_read_timeout = baml.time.Duration.from_seconds(10),
     )
 }

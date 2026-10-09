@@ -13,6 +13,7 @@ export const reviewers:Record<string,{initials:string;color:string;role:string}>
 export let ownership='';
 export const state={user:'',selected:'',showAll:false,tab:'review',split:false,decisions:[] as Decision[],pendingDecisions:[] as Decision[],drafts:[] as Comment[],comments:[] as Comment[],overrides:[] as Override[],revision:{} as Record<string,string>,activity:[] as {text:string;at:string}[]};
 let csrf='';
+let persisted:Persisted;
 export let busy=false;
 const run=new URLSearchParams(location.search).get('run')||'';
 async function api<T>(path:string,body?:unknown):Promise<T>{
@@ -33,6 +34,7 @@ export async function load(){
  restore(page.state);
 }
 function restore(data:Persisted){
+ persisted=structuredClone(data);
  state.decisions=data.events.filter(e=>e.kind==='decision').map(e=>e.data as Decision);
  state.comments=data.events.filter(e=>e.kind==='comment').map(e=>e.data as Comment);
  state.overrides=data.events.filter(e=>e.kind==='override').map(e=>e.data as Override);
@@ -40,7 +42,7 @@ function restore(data:Persisted){
  state.activity=data.events.map(e=>({at:new Date(e.at).toLocaleString(),text:e.kind==='decision'?`@${(e.data as Decision).user} ${(e.data as Decision).kind==='approve'?'approved':'requested changes on'} ${(e.data as Decision).file}${(e.data as Decision).body?': '+(e.data as Decision).body:''}`:e.kind==='comment'?`@${(e.data as Comment).user} commented on ${(e.data as Comment).file}`:`Admin @${(e.data as Override).by} overrode a block: ${(e.data as Override).reason}`}));
 }
 async function write(action:string,body:Record<string,unknown>={}){if(busy)throw new Error('A review update is already saving.');busy=true;try{restore(await api<Persisted>('/api/workspace',{run_id:run,head:page.review.identity.head,action,...body}));}finally{busy=false;}}
-export async function saveDrafts(){try{await write('draft',{draft:{decisions:state.pendingDecisions,comments:state.drafts}});}catch(e){restore(await api<Persisted>('/api/workspace/state?run='+encodeURIComponent(run)));throw e;}}
+export async function saveDrafts(){try{await write('draft',{draft:{decisions:state.pendingDecisions,comments:state.drafts}});}catch(e){restore(structuredClone(persisted));throw e;}}
 export async function publish(){await write('submit');}
 export async function overrideBlock(block:string,reason:string){await write('override',{block,reason});}
 export async function loadContent(file:ReviewFile){if(file.loaded)return;try{const data=await api<{original:string;modified:string}>('/api/workspace/content?run='+encodeURIComponent(run)+'&file='+encodeURIComponent(file.id));file.original=data.original;file.modified=data.modified;file.loaded=true;}catch(e){file.contentError=e instanceof Error?e.message:String(e);file.original='';file.modified='Diff unavailable: '+file.contentError+'\nOpen this file on GitHub to inspect it.';}}

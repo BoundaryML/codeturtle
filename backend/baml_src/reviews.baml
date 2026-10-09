@@ -90,17 +90,10 @@ function reviewer_identity(
     auth: BrowserAuth,
     req: baml.http.ServerRequest,
     run: StoredRun,
+    actor: Actor,
 ) -> ReviewIdentity {
     let repository_id = run.authorized.identity.repository_id;
-    let actor = auth.authorize(req, repository_id);
-    let membership = auth.store.rpc(
-        "authorize",
-        { "actor": baml.json.from(actor), "repository_id": repository_id, "setup": false },
-    );
-    let token = auth.secrets.open(
-        str(membership, "encrypted_token"),
-        "github-user:" + actor.user_id + ":" + repository_id,
-    );
+    let token = auth.repository_access(actor, repository_id);
     let user = auth.http.send("GET", "https://api.github.com/user", token, null);
     let login = str(user, "login").to_lower_case();
     let eligible = ["@" + login];
@@ -144,7 +137,7 @@ function review_page(
     require(matches(id, "^[a-f0-9-]{36}$"), 400, "invalid_run");
     let view = auth.store.rpc("review", { "actor": actor, "id": id });
     let run = baml.json.to<StoredRun>(auth.store.rpc("review_run", { "actor": actor, "id": id }));
-    let reviewer = reviewer_identity(auth, req, run);
+    let reviewer = reviewer_identity(auth, req, run, baml.json.to<Actor>(actor));
     let decisions = baml.json.to<ReviewDecision[]>(auth.store.rpc("review_decisions", { "id": id }));
     let current = {
         github.check_current(run.authorized);

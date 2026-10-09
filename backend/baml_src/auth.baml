@@ -222,6 +222,16 @@ class BrowserAuth {
         setup: bool = false,
     ) -> Actor {
         let actor = baml.json.to<Actor>(field(self.session(req, mutation = setup), "actor"));
+        let _ = self.repository_access(actor, repository_id, setup = setup);
+        actor
+    }
+    // Reuse this request's verified actor and token; never cache authorization across requests.
+    function repository_access(
+        self,
+        actor: Actor,
+        repository_id: string,
+        setup: bool = false,
+    ) -> string {
         let membership = self.store.rpc(
             "authorize",
             { "actor": baml.json.from(actor), "repository_id": repository_id, "setup": setup },
@@ -244,7 +254,7 @@ class BrowserAuth {
             403,
             "repository_access_revoked",
         );
-        actor
+        token
     }
 }
 

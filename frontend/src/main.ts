@@ -58,7 +58,7 @@ function reviewerProgress(user: string) {
 }
 
 function header() {
- return `<header class="appbar"><div class="brand"><a href="/"><img class="brand-logo" src="/codeturtle.svg" alt="Repositories" /></a><span class="brand-wordmark">codeturtle<span class="brand-tagline">Review at human speed.</span></span><span class="brand-divider">/</span><span class="repo-name">${escape(page.review.identity.repository)}</span></div><nav aria-label="Workspace">${[['review','Review'],['github','PR message'],['slack','Slack'],['ownership','Ownership']].map(([tab,label])=>`<button data-tab="${tab}" class="${state.tab===tab?'active':''}">${label}</button>`).join('')}</nav><span class="identity">${avatar(state.user,true)}@${escape(state.user)}</span></header><section class="prbar"><div class="pr-title"><div class="pr-kicker"><span class="codicon codicon-git-pull-request"></span><a href="https://github.com/${escape(page.review.identity.repository)}/pull/${page.review.identity.pr}">Pull request #${page.review.identity.pr}</a></div><h1>${escape(page.review.title)}</h1><div class="prmeta"><code>${page.review.identity.head.slice(0,12)}</code><span>· ${files.length} files changed</span>${page.review.envelope?.report?.errors.map(e=>`<span class="blocked">${escape(e.message)}</span>`).join('') || ''}${page.review.envelope?.report?.unowned_files.length?'<span class="blocked">Ownership gaps need attention</span>':''}${!page.current?'<span class="blocked">Outdated report · open the latest PR comment</span>':''}</div></div></section>`;
+ return `<header class="appbar"><div class="brand"><a href="/"><img class="brand-logo" src="/codeturtle.svg" alt="Repositories" /></a><span class="brand-wordmark">codeturtle<span class="brand-tagline">slow down and read the code</span></span><span class="repo-name">${escape(page.review.identity.repository)}</span></div><nav aria-label="Workspace">${[['review','Review'],['github','PR message'],['slack','Slack'],['ownership','Ownership']].map(([tab,label])=>`<button data-tab="${tab}" class="${state.tab===tab?'active':''}">${label}</button>`).join('')}</nav><span class="identity">${avatar(state.user,true)}@${escape(state.user)}</span></header><section class="prbar"><div class="pr-title"><div class="pr-kicker"><span class="codicon codicon-git-pull-request"></span><a href="https://github.com/${escape(page.review.identity.repository)}/pull/${page.review.identity.pr}">Pull request #${page.review.identity.pr}</a></div><h1>${escape(page.review.title)}</h1><div class="prmeta"><code>${page.review.identity.head.slice(0,12)}</code><span>· ${files.length} files changed</span>${page.review.envelope?.report?.errors.map(e=>`<span class="blocked">${escape(e.message)}</span>`).join('') || ''}${page.review.envelope?.report?.unowned_files.length?'<span class="blocked">Ownership gaps need attention</span>':''}${!page.current?'<span class="blocked">Outdated report · open the latest PR comment</span>':''}</div></div></section>`;
 }
 
 function fileTree() {
@@ -148,16 +148,34 @@ function modal(content: string, onSubmit: (data: FormData, dialog: HTMLDialogEle
   document.body.append(dialog);
   dialog.addEventListener('close', () => dialog.remove());
   dialog.querySelector('[data-cancel]')?.addEventListener('click', () => dialog.close());
-  dialog.querySelector('form')!.addEventListener('submit', event => { event.preventDefault(); if(busy)return; void Promise.resolve(onSubmit(new FormData(event.target as HTMLFormElement), dialog)).catch(e=>{ let error=dialog.querySelector('.form-error'); if(!error){ error=document.createElement('p');error.className='form-error';dialog.append(error); } error.textContent=String(e instanceof Error?e.message:e); }); });
+  dialog.querySelector('form')!.addEventListener('submit', async event => {
+    event.preventDefault(); if (busy) return;
+    const form = event.target as HTMLFormElement;
+    const submit = form.querySelector<HTMLButtonElement>('[type="submit"]')!;
+    const label = submit.textContent;
+    const data = new FormData(form);
+    submit.disabled = true; submit.textContent = 'Saving…';
+    dialog.querySelector('.form-error')?.remove();
+    try { await onSubmit(data, dialog); }
+    catch (e) {
+      const error = document.createElement('p'); error.className = 'form-error';
+      error.textContent = e instanceof Error && e.message === 'service_unavailable'
+        ? 'The service is temporarily unavailable. Your text is still here; try saving again.'
+        : String(e instanceof Error ? e.message : e);
+      dialog.append(error);
+    } finally { submit.disabled = false; submit.textContent = label; }
+  });
   dialog.showModal(); return dialog;
 }
 
 function openComment(line: number, side: Side = 'RIGHT', replyTo: string | null = null) {
   const file = selected();
   if (!owns(file) || !page.current) { toast('You can comment on files you own.'); return; }
+  const draftId = crypto.randomUUID();
   modal(`<div class="modal-eyebrow">DRAFT COMMENT</div><h2>${replyTo ? 'Reply to this thread' : 'Leave a note'}</h2><p>${escape(file.name)} · ${side === 'LEFT' ? 'original' : 'new'} line ${line}</p><label class="field-label" for="comment-body">Comment</label><textarea id="comment-body" name="body" required rows="5" placeholder="What should the author know?" autofocus></textarea><div class="modal-note">This stays private until you submit your review.</div><div class="modal-actions"><button class="button ghost" type="button" data-cancel>Cancel</button><button class="button primary" type="submit">Save draft</button></div>`, async (data, dialog) => {
     const body = String(data.get('body') || '').trim(); if (!body) return;
-    state.drafts.push({ id: crypto.randomUUID(), file: file.id, revision: state.revision[file.id], user: state.user, line, side, body, replyTo });
+    state.drafts = state.drafts.filter(draft => draft.id !== draftId);
+    state.drafts.push({ id: draftId, file: file.id, revision: state.revision[file.id], user: state.user, line, side, body, replyTo });
     await saveDrafts(); dialog.close(); render(); toast('Draft saved. It will publish with your review.');
   });
 }
