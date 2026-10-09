@@ -217,7 +217,11 @@ class ReportService {
                     "content-security-policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
                     "x-content-type-options": "nosniff",
                     "referrer-policy": "no-referrer",
-                    "cache-control": "no-store",
+                    "cache-control": if (route.starts_with("/assets/")) {
+                        "public, max-age=31536000, immutable"
+                    } else {
+                        "no-store"
+                    },
                 },
                 {
                     let asset = baml.fs.open(config("CODETURTLE_FRONTEND_DIR") + "/" + file, "r");
