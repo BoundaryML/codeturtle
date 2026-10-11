@@ -23,6 +23,7 @@ For integration tests, provide the private handoffs through local paths:
 ```sh
 CODETURTLE_TEST_SQL=/private/operator-handoff.md \
 CODETURTLE_TEST_REVIEW_SQL=/private/review-signoffs.md \
+CODETURTLE_TEST_PERFORMANCE_SQL=/private/workspace-performance.sql \
 CODETURTLE_TEST_REFRESH_SQL=/private/github-refresh.md \
   backend/.venv/bin/python -m unittest discover -s backend/tests -p test_service.py -v
 ```

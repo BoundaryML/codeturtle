@@ -235,3 +235,6 @@ __marimo__/
 
 # Local review receiver credentials and generated planning pages
 plans/.reviews/
+
+# Database provisioning stays in the private operator handoff
+/backend/migrations/

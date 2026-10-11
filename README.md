@@ -67,6 +67,7 @@ baml --agent-skill-check off test --directory backend
 backend/.venv/bin/python -m unittest discover -s backend/tests -p test_crypto.py -v
 CODETURTLE_TEST_SQL=/absolute/path/to/operator-handoff.md \
 CODETURTLE_TEST_REVIEW_SQL=/absolute/path/to/codeturtle-review-signoffs.md \
+CODETURTLE_TEST_PERFORMANCE_SQL=/absolute/path/to/codeturtle-workspace-performance-private.sql \
   backend/.venv/bin/python -m unittest discover -s backend/tests -p test_service.py -v
 npm --prefix frontend run build
 ```

@@ -48,7 +48,9 @@ class ServiceTests(unittest.TestCase):
         if refresh_sql_path:
             refresh=Path(refresh_sql_path).read_text().split('```sql\n')[1].split('```')[0]
             cls.sql(refresh);cls.sql(refresh)
-        performance=(ROOT/"backend/migrations/003_workspace_performance.sql").read_text()
+        performance_path=os.environ.get('CODETURTLE_TEST_PERFORMANCE_SQL')
+        if not performance_path: raise RuntimeError('Set CODETURTLE_TEST_PERFORMANCE_SQL to the private workspace performance SQL handoff')
+        performance=Path(performance_path).read_text()
         cls.sql(performance);cls.sql(performance)
         cls.key=rsa.generate_private_key(public_exponent=65537,key_size=2048)
         cls.pem=cls.key.private_bytes(serialization.Encoding.PEM,serialization.PrivateFormat.PKCS8,serialization.NoEncryption()).decode()
