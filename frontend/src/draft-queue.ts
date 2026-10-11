@@ -11,7 +11,7 @@ export function applyOperation<T extends DraftItem>(draft:Draft<T>, op:DraftOper
  else next[bucket]=next[bucket].filter(x=>x.id!==op.id);
  return next;
 }
-type Pending<T extends DraftItem>={id:string;op:DraftOperation<T>;expected?:number;error?:Error};
+export type Pending<T extends DraftItem>={id:string;op:DraftOperation<T>;expected?:number;error?:Error};
 export class DraftQueue<T extends DraftItem>{
  pending:Pending<T>[]=[];
  running=false;
@@ -28,7 +28,7 @@ export class DraftQueue<T extends DraftItem>{
  private async drain(){
   this.running=true;
   try{while(this.pending.length&&!this.pending[0].error){
-   const next=this.pending[0];next.expected??=this.version;
+   const next=this.pending[0];next.expected??=this.version;this.changed();
    try{const ack=await this.send(next.op,next.id,next.expected);this.base=applyOperation(this.base,next.op);this.version=ack.version;this.pending.shift();}
    catch(e){next.error=e instanceof Error?e:new Error(String(e));}
    this.changed();

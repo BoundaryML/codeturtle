@@ -156,3 +156,7 @@ unverifiable membership never grants sign-off rights. Team rows represent a grou
 owner; any verified member can satisfy that owner's slot. A reviewer can only remove
 their own decision. Diffs use immutable merge-base/head commits; binary/large or
 GitHub-truncated comparisons link back to the PR. No automatic GitHub review is submitted.
+
+### Refresh a stale review
+
+When the base branch advances, old reviews remain blocked. A maintainer can apply the `codeturtle-refresh` label to the PR (remove and re-add it if already present) to create a new run against the current base and head. This uses the existing trusted `pull_request_target` path; rerunning an old Actions run retains its old event and is not sufficient. Existing installations must merge the updated workflow and verify setup again to trust its new blob. Refresh is explicit, not automatic on every base push.

@@ -95,10 +95,10 @@ function workspace_context(auth: BrowserAuth, req: baml.http.ServerRequest, id: 
     context
 }
 
-function workspace_access(auth: BrowserAuth, context: json) -> json {
+function workspace_access(auth: BrowserAuth, context: json, resolved_token: string? = null) -> json {
     let e = baml.json.to<Enrollment>(field(context, "enrollment"));
-    let token = workspace_token(auth, context);
-    let repo = auth.http.send("GET", "https://api.github.com/repos/" + e.repository, token, null);
+    let token = resolved_token ?? workspace_token(auth, context);
+    let repo = github_user_get(auth.http, "https://api.github.com/repos/" + e.repository, token);
     require(num(repo, "id").to_string() == e.repository_id && field(field(repo, "permissions"), "pull") == true, 403, "repository_access_revoked");
     {"token": token, "admin": field(context, "can_setup") == true && field(field(repo, "permissions"), "admin") == true}
 }
@@ -107,23 +107,25 @@ function workspace_get(auth: BrowserAuth, req: baml.http.ServerRequest, github: 
     let context = workspace_context(auth, req, query(req.url).get("run") ?? "");
     let actor = field(context, "actor");
     let run = workspace_run(context);
-    let access_future = spawn { workspace_access(auth, context) };
-    let reviewer_future = spawn { reviewer_with_token(auth, run, workspace_token(auth, context)) };
+    let token = workspace_token(auth, context);
+    let access_future = spawn { workspace_access(auth, context, resolved_token = token) };
+    let reviewer_future = spawn { reviewer_with_token(auth, run, token) };
     let state_future = spawn { auth.store.rpc("workspace_view", {"actor":actor, "id":run.id}) };
     let current_future = spawn { { github.check_current(run.authorized); true } catch_all (_) { _ => false } };
     let files = if (field(context, "files") != null) {field(context, "files")} else {workspace_snapshot(auth, actor, run, github)};
     let access = await access_future;
     let reviewer = await reviewer_future;
     let report: json = if (run.envelope == null) {null} else { {"report": {"evaluation_complete":field(run.envelope?.report, "evaluation_complete"), "errors":field(run.envelope?.report, "errors"), "unowned_files":field(run.envelope?.report, "unowned_files")}} };
-    {"csrf": field(context,"csrf"), "review": {"run_id":run.id, "identity":baml.json.from(run.authorized.identity), "title":run.authorized.title, "envelope":report, "deliveries":baml.json.from(run.deliveries)}, "reviewer":baml.json.from(reviewer), "files":files, "state":await state_future, "current":await current_future, "admin":field(access,"admin")}
+    {"draft_scope": sha256(baml.json.stringify(actor)), "csrf": field(context,"csrf"), "review": {"run_id":run.id, "identity":baml.json.from(run.authorized.identity), "title":run.authorized.title, "envelope":report, "deliveries":baml.json.from(run.deliveries)}, "reviewer":baml.json.from(reviewer), "files":files, "state":await state_future, "current":await current_future, "admin":field(access,"admin")}
 }
 
 function workspace_write(auth: BrowserAuth, req: baml.http.ServerRequest, github: GitHubClient) -> json {
     let body = baml.json.parse(req.body);
     let context = workspace_context(auth, req, str(body,"run_id"), mutation = true);
     let run = workspace_run(context);
-    let access_future = spawn { workspace_access(auth, context) };
-    let reviewer = reviewer_with_token(auth, run, workspace_token(auth, context));
+    let token = workspace_token(auth, context);
+    let access_future = spawn { workspace_access(auth, context, resolved_token = token) };
+    let reviewer = reviewer_with_token(auth, run, token);
     let access = await access_future;
     let operation = field(body,"action") == "operation";
     if (field(body,"action") == "override") { require(field(access,"admin") == true,403,"repository_access_revoked"); }
@@ -199,5 +201,5 @@ function workspace_run(context: json) -> StoredRun {
 function workspace_token(auth: BrowserAuth, context: json) -> string {
     let actor = baml.json.to<Actor>(field(context,"actor"));
     let e = baml.json.to<Enrollment>(field(context,"enrollment"));
-    auth.secrets.open(str(context,"encrypted_token"),"github-user:" + actor.user_id + ":" + e.repository_id)
+    github_membership_token(auth, actor, e.repository_id, str(context,"encrypted_token"))
 }

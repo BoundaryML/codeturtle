@@ -1,0 +1,49 @@
+name: Source checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      BAML_TELEMETRY: 'off'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install pinned dependencies
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/quality-venv"
+          "$RUNNER_TEMP/quality-venv/bin/pip" install -r backend/requirements.txt
+          echo "$RUNNER_TEMP/quality-venv/bin" >> "$GITHUB_PATH"
+          python3 cli/scripts/install_runtime.py --url 'https://github.com/BoundaryML/baml/releases/download/baml-language-0.20.2-nightly.20261004.a/baml-language-0.20.2-nightly.20261004.a-x86_64-unknown-linux-musl.tar.gz' --sha256 f04ac48a55c52a97c3b8ace0db0d0da351d85ab6f9bb14e79ebab817a7b5777c --destination "$RUNNER_TEMP/baml-bin/baml"
+          echo "$RUNNER_TEMP/baml-bin" >> "$GITHUB_PATH"
+          npm ci --prefix frontend
+      - name: Check and test source
+        run: |
+          set -euo pipefail
+          baml --agent-skill-check off check --directory backend
+          baml --agent-skill-check off test --directory backend
+          baml --agent-skill-check off test --directory cli
+          python -m unittest discover -s cli -p test_reporting.py -v
+          python -m unittest discover -s backend/tests -p test_crypto.py -v
+          python -m unittest discover -s heal/tests -v
+          npm test --prefix frontend
+          npm run build --prefix frontend
+      - name: Verify CLI package
+        run: |
+          set -euo pipefail
+          python -m pip wheel --no-deps ./cli --wheel-dir "$RUNNER_TEMP/wheels"
+          python -m pip install --no-deps "$RUNNER_TEMP"/wheels/codeturtle-*.whl
+          cd "$RUNNER_TEMP"
+          codeturtle help

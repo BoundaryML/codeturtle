@@ -1,3 +1,4 @@
+import {DraftJournal} from './draft-journal';
 import {DraftQueue, type DraftOperation} from './draft-queue';
 export type Side='LEFT'|'RIGHT';
 export type Decision={id:string;file:string;user:string;revision:string;kind:'approve'|'changes';body:string;owners?:string[]};
@@ -7,7 +8,7 @@ type Requirement={path:string;owners:string[];approval:'Any'|'All';evaluation:{r
 export type ReviewFile={id:string;name:string;directory:string;language:string;owners:string[];requirements:Requirement[];revision:string;all:boolean;rule:string;ruleLine:number;additions:number;deletions:number;original:string;modified:string;loaded:boolean;contentError?:string;change:null|{additions:number;deletions:number}};
 type Event={kind:'decision'|'comment'|'override';data:Decision|Comment|Override;at:string};
 type Persisted={version:number;events:Event[];draft:{decisions:Decision[];comments:Comment[]}};
-type Page={csrf:string;review:{run_id:string;title:string;identity:{repository:string;pr:number;head:string};envelope:null|{report:null|{evaluation_complete:boolean;errors:{message:string}[];unowned_files:string[]}};deliveries:Record<string,{status:string}>};reviewer:{login:string;eligible_owners:string[]};files:ReviewFile[];state:Persisted;current:boolean;admin:boolean};
+type Page={draft_scope:string;csrf:string;review:{run_id:string;title:string;identity:{repository:string;pr:number;head:string};envelope:null|{report:null|{evaluation_complete:boolean;errors:{message:string}[];unowned_files:string[]}};deliveries:Record<string,{status:string}>};reviewer:{login:string;eligible_owners:string[]};files:ReviewFile[];state:Persisted;current:boolean;admin:boolean};
 export let page:Page;
 export const files:ReviewFile[]=[];
 export const reviewers:Record<string,{initials:string;color:string;role:string}>={};
@@ -17,14 +18,16 @@ let csrf='';
 let persisted:Persisted;
 let queue:DraftQueue<Comment|Decision>;
 let publishing=false;
+let journalError='';
+let journal:DraftJournal<Comment|Decision>|undefined;
 function draftWritable(){if(publishing)throw new Error("Wait for review publication to finish.");}
 const listeners=new Set<()=>void>();
 export function subscribe(listener:()=>void){listeners.add(listener);return ()=>listeners.delete(listener);}
 function notify(){for(const listener of listeners)listener();}
 export function saving(){return queue?.pending.length||0;}
-export function saveError(){return queue?.error?.message||'';}
+export function saveError(){return journalError||queue?.error?.message||'';}
 export function draftStatus(id:string){const p=queue?.pending.find(p=>'item' in p.op&&p.op.item.id===id);return p?(p.error?'Not saved':'Saving…'):'Saved privately';}
-function syncQueue(){if(!queue)return;const view=queue.view;state.drafts=view.comments as Comment[];state.pendingDecisions=view.decisions as Decision[];invalidateStatuses();notify();}
+function syncQueue(){if(!queue)return;try{journal?.save(queue.pending);journalError='';}catch{journalError='Browser draft recovery is unavailable. Keep this tab open until edits finish saving.';}const view=queue.view;state.drafts=view.comments as Comment[];state.pendingDecisions=view.decisions as Decision[];invalidateStatuses();notify();}
 function enqueueDraft(operation:DraftOperation<Comment|Decision>){draftWritable();const start=performance.now();queue.enqueue(operation);performance.measure("ct-local-draft",{start,end:performance.now()});}
 export function upsertComment(item:Comment){enqueueDraft({kind:'upsert_comment',item});}
 export function deleteDraft(id:string){enqueueDraft({kind:'delete_comment',id});}
@@ -34,11 +37,16 @@ export async function retryDrafts(){await queue.retry(queue.error?.message==='dr
 
 export let busy=false;
 const run=new URLSearchParams(location.search).get('run')||'';
+function authRedirect(url:string){
+ const composing=Array.from(document.querySelectorAll<HTMLTextAreaElement>('dialog[open] textarea')).some(input=>input.value.trim().length>0);
+ if(composing||journalError)throw new Error('Sign-in is required. Save or copy the open comment first, then retry. Your edits are still in this tab.');
+ location.href=url;
+}
 async function api<T>(path:string,body?:unknown):Promise<T>{
  const response=await fetch(path,{method:body===undefined?'GET':'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:body===undefined?undefined:JSON.stringify(body)});
- if(response.status===401){location.href='/auth/login?next='+encodeURIComponent(location.pathname+location.search);throw new Error('Redirecting to sign in…');}
+ if(response.status===401){authRedirect('/auth/login?next='+encodeURIComponent(location.pathname+location.search));throw new Error('Redirecting to sign in…');}
  const data=await response.json();
- if(!response.ok){if(data.error==='repository_forbidden'){location.href='/auth/github/start?run='+encodeURIComponent(run)+'&next='+encodeURIComponent(location.pathname+location.search);throw new Error('Connecting your GitHub identity…');}throw new Error(String(data.error||'Request failed'));}
+ if(!response.ok){if(data.error==='repository_forbidden'||data.error==='github_reconnect_required'){authRedirect('/auth/github/start?run='+encodeURIComponent(run)+'&next='+encodeURIComponent(location.pathname+location.search));throw new Error('Connecting your GitHub identity…');}throw new Error(String(data.error||'Request failed'));}
  return data as T;
 }
 export function owns(file:ReviewFile){return file.owners.some(o=>page.reviewer.eligible_owners.includes('@'+o));}
@@ -56,11 +64,14 @@ export async function load(){
   try{return await api<{version:number}>('/api/workspace',{run_id:run,head:page.review.identity.head,action:'operation',operation_id:id,expected_version:version,operation});}
   finally{performance.measure('ct-durable-draft',{start:started,end:performance.now()});}
  },syncQueue);
+ journal=new DraftJournal(sessionStorage,[page.draft_scope,state.user,run,page.review.identity.head]);
+ queue.pending=journal.restore();
+ syncQueue();
 }
 function restore(data:Persisted){
  persisted=structuredClone(data);
  state.decisions=data.events.filter(e=>e.kind==='decision').map(e=>e.data as Decision);
- state.comments=data.events.filter(e=>e.kind==='comment').map(e=>e.data as Comment);
+ state.comments=[...commentPages.values()].flatMap(p=>p.items);
  state.overrides=data.events.filter(e=>e.kind==='override').map(e=>e.data as Override);
  state.pendingDecisions=data.draft.decisions;state.drafts=data.draft.comments;
  invalidateStatuses();
@@ -74,7 +85,7 @@ export async function publish(){
  catch(e){if(e instanceof Error&&e.message==='draft_conflict'&&!queue.error){await refreshState();throw new Error('Another tab changed this draft. Review the updated draft before submitting.');}throw e;}
  finally{publishing=false;}
 }
-export async function overrideBlock(block:string,reason:string){await queue.flush();await write('override',{block,reason});await refreshState();}
+export async function overrideBlock(block:string,reason:string){if(publishing)throw new Error('A review update is in progress.');publishing=true;try{await queue.flush();await write('override',{block,reason});await refreshState();}finally{publishing=false;}}
 async function refreshState(){const fresh=await api<Persisted>('/api/workspace/state?run='+encodeURIComponent(run));restore(fresh);queue.base=fresh.draft;queue.version=fresh.version;commentPages.clear();await loadComments(state.selected);notify();}
 const contents=new Map<string,Promise<void>>();
 const contentLRU=new Map<string,ReviewFile>();

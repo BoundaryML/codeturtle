@@ -95,6 +95,34 @@ class GitHubClient {
     function check_current(self, run: AuthorizedRun) -> void {
         let _ = self.current_pr(run.identity, self.installation_token(run.enrollment));
     }
+    function request_reviewers(self, run: StoredRun, token: string, pr: json, decisions: ReviewDecision[]) -> void {
+        let envelope = run.envelope;
+        if (envelope == null) { return; }
+        if (envelope.setup_failure != null || field(pr, "draft") == true) { return; }
+        let i = run.authorized.identity;
+        let requested = self.api("GET", i.repository, `/pulls/${i.pr}/requested_reviewers`, token);
+        let existing = baml.json.to<json[]>(field(requested, "users")).map((u) -> { str(u, "login").to_lower_case() });
+        let teams = baml.json.to<json[]>(field(requested, "teams")).map((t) -> { str(t, "slug").to_lower_case() });
+        // Do not re-request someone who already submitted a review for this head.
+        let page = 1;
+        while (true) {
+            let reviews = baml.json.to<json[]>(self.api("GET", i.repository, `/pulls/${i.pr}/reviews?per_page=100&page=${page}`, token));
+            for (let review in reviews) {
+                if (field(review, "commit_id") == i.head && field(review, "state") != "PENDING" && field(review, "state") != "DISMISSED" && field(review, "user") != null) {
+                    existing.push(str(field(review, "user"), "login").to_lower_case());
+                }
+            }
+            if (reviews.length() < 100) { break; }
+            require(page < 100, 503, "review_reconciliation_limit");
+            page += 1;
+        }
+        let owners = reviewer_rows(envelope.report, decisions, "", run.id).filter((r) -> { r.completed < r.indices.length() }).map((r) -> { r.owner });
+        let plan = native_review_requests(owners, str(field(pr, "user"), "login"), i.repository.split("/")[0], existing, teams);
+        if (baml.json.to<string[]>(field(plan, "reviewers")).length() > 0 || baml.json.to<string[]>(field(plan, "team_reviewers")).length() > 0) {
+            let _ = self.current_pr(i, token);
+            let _ = self.api("POST", i.repository, `/pulls/${i.pr}/requested_reviewers`, token, body = plan);
+        }
+    }
     function upsert_pr_comment(
         self,
         run: StoredRun,
@@ -104,7 +132,8 @@ class GitHubClient {
     ) -> CommentRef {
         let i = run.authorized.identity;
         let token = self.installation_token(run.authorized.enrollment, write = true);
-        let _ = self.current_pr(i, token);
+        let pr = self.current_pr(i, token);
+        self.request_reviewers(run, token, pr, decisions);
         let marker = `<!-- codeturtle:${i.repository_id}:${i.pr} -->`;
         let body = github_report(run, origin, decisions = decisions)
             + review_audit_markdown(events)
@@ -330,4 +359,26 @@ function review_audit_markdown(events: json[]) -> string {
     } else {
         text
     }
+}
+
+// GitHub cannot request a review from the PR author. Team slugs are scoped to
+// the repository organization; never reinterpret an unrelated org/team.
+function native_review_requests(owners: string[], author: string, organization: string, existing: string[], existing_teams: string[]) -> json {
+    let users: string[] = [];
+    let teams: string[] = [];
+    for (let owner in owners) {
+        let name = owner.to_lower_case();
+        if (name.starts_with("@")) { name = name.slice(1, name.length()); }
+        if (matches(name, "^[a-z0-9][a-z0-9-]*$")) {
+            if (name != author.to_lower_case() && !existing.includes(name) && !users.includes(name)) { users.push(name); }
+        } else if (matches(name, "^[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9_-]*$")) {
+            let parts = name.split("/");
+            if (parts[0] == organization.to_lower_case() && !existing_teams.includes(parts[1]) && !teams.includes(parts[1])) { teams.push(parts[1]); }
+        }
+    }
+    {"reviewers": baml.json.from(users), "team_reviewers": baml.json.from(teams)}
+}
+
+test "Native requests omit author duplicates existing and foreign teams" {
+    assert.equal(native_review_requests(["@ATX24", "@alice", "@ALICE", "@bob", "@BoundaryML/core", "@elsewhere/core", "@"], "atx24", "BoundaryML", ["bob"], []), {"reviewers": ["alice"], "team_reviewers": ["core"]})
 }

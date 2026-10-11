@@ -44,6 +44,10 @@ class ServiceTests(unittest.TestCase):
         if not review_sql_path: raise RuntimeError('Set CODETURTLE_TEST_REVIEW_SQL to the reviewer SQL update')
         update=Path(review_sql_path).read_text().split('```sql\n')[1].split('```')[0]
         cls.sql(update);cls.sql(update)
+        refresh_sql_path=os.environ.get('CODETURTLE_TEST_REFRESH_SQL')
+        if refresh_sql_path:
+            refresh=Path(refresh_sql_path).read_text().split('```sql\n')[1].split('```')[0]
+            cls.sql(refresh);cls.sql(refresh)
         performance=(ROOT/"backend/migrations/003_workspace_performance.sql").read_text()
         cls.sql(performance);cls.sql(performance)
         cls.key=rsa.generate_private_key(public_exponent=65537,key_size=2048)
@@ -143,7 +147,12 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
             if data['payload']['code']=='wrong-org': result['organization_id']='other-tenant'
             return result
         if url == 'https://api.github.com/user':return {'id':1,'login':'one'}
-        if url == 'https://github.com/login/oauth/access_token':return {'access_token':'reader'}
+        if url == 'https://github.com/login/oauth/access_token':
+            if data['payload'].get('grant_type')=='refresh_token':
+                cls.refresh_calls+=1
+                if cls.refresh_calls>1: raise ValueError('single use token replayed')
+                return {'access_token':'renewed','refresh_token':'next-refresh','expires_in':28800,'refresh_token_expires_in':15897600}
+            return {'access_token':'reader'}
         if '/user/installations/' in url:return {'repositories':[{'id':42,'full_name':'acme/repo','permissions':{'admin':False,'pull':True},'default_branch':'main'}]}
         if '/compare/' in url and '?' in url:return {'files':[{'filename':'a.txt','sha':'d'*40,'status':'modified','additions':1,'deletions':1,'patch':'@@ -1 +1 @@\n-before\n+after'}]}
         if url.endswith('/.well-known/jwks'):return {'keys':[cls.jwk]}
@@ -151,7 +160,11 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
         if url.endswith('/repos/acme/repo'):return {'id':42,'permissions':{'admin':True,'pull':True},'default_branch':'main'}
         if '/contents/' in url:return {'sha':'c'*40,'encoding':'base64','size':6,'content':__import__('base64').b64encode(('before\n' if url.endswith(cls.base) else 'after\n').encode()).decode()}
         if '/actions/runs/' in url:return {'id':123,'run_attempt':1,'event':'pull_request_target','head_sha':cls.run_head,'path':'.github/workflows/codeturtle.yml','status':'in_progress','pull_requests':[{'number':7,'base':{'repo':{'id':42}}}]}
-        if url.endswith('/pulls/7'):return {'state':'open','head':{'sha':cls.live_head},'base':{'sha':cls.base,'ref':'main','repo':{'id':42}},'title':'Test PR'}
+        if url.endswith('/pulls/7'):return {'state':'open','head':{'sha':cls.live_head},'base':{'sha':cls.base,'ref':'main','repo':{'id':42}},'title':'Test PR','draft':False,'user':{'login':'author'}}
+        if '/requested_reviewers' in url:
+            if method=='POST': cls.requested_users.extend(data['payload']['reviewers']);cls.native_requests+=1
+            return {'users':[{'login':u} for u in cls.requested_users],'teams':[]}
+        if '/reviews?' in url:return []
         if '/compare/' in url:return {'merge_base_commit':{'sha':cls.base}}
         if '/comments?' in url:return cls.comments
         if '/comments' in url:
@@ -164,7 +177,7 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
     def setUp(self):
         self.sql('TRUNCATE codeturtle_private.deliveries,codeturtle_private.runs,codeturtle_private.enrollments,codeturtle_private.memberships,codeturtle_private.setups CASCADE')
         literal=json.dumps(self.enrollment).replace("'","''");self.sql("INSERT INTO codeturtle_private.enrollments VALUES('42','"+literal+"')")
-        type(self).provider_calls=[];type(self).comments=[];type(self).posts=0;type(self).fail_post=False;type(self).provider_down=False;type(self).live_head=self.head;type(self).run_head=self.head
+        type(self).refresh_calls=0;type(self).requested_users=[];type(self).native_requests=0;type(self).provider_calls=[];type(self).comments=[];type(self).posts=0;type(self).fail_post=False;type(self).provider_down=False;type(self).live_head=self.head;type(self).run_head=self.head
     def request(self,path,token='',body=None,method=None,headers=None):
         raw=body if isinstance(body,bytes) else json.dumps(body).encode() if body is not None else None
         req=urllib.request.Request(self.origin+path,data=raw,method=method,headers={'Authorization':'Bearer '+token,'Content-Type':'application/json',**(headers or {})})
@@ -610,5 +623,63 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
         first=self.request(path,headers=h)[1];self.assertEqual(len(first['events']),50);self.assertTrue(first['more'])
         second=self.request(path+'&after='+str(first['cursor']),headers=h)[1];self.assertEqual(len(second['events']),5);self.assertFalse(second['more'])
         self.assertLess(first['events'][-1]['seq'],second['events'][0]['seq'])
+
+    @unittest.skipUnless(os.environ.get('CODETURTLE_TEST_REFRESH_SQL'), 'private refresh handoff required')
+    def test_refresh_claim_serializes_and_cannot_overwrite_reconnect(self):
+        headers,actor=self.reviewer_session()
+        encrypted=self.sql("SELECT encrypted_token FROM codeturtle_private.memberships")
+        p={'actor':actor,'repository_id':'42','encrypted_token':encrypted}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            results=list(pool.map(lambda _:self.rpc('ct_github_refresh_claim',p),range(2)))
+        self.assertEqual(sum(r.get('state')=='claimed' for r in results),1)
+        self.assertEqual(sum(r.get('status')==503 for r in results),1)
+        claim=next(r['claim'] for r in results if r.get('state')=='claimed')
+        # A GitHub reconnect wins over an in-flight refresh commit.
+        self.sql("UPDATE codeturtle_private.memberships SET encrypted_token='reconnected'")
+        self.assertEqual(self.rpc('ct_github_refresh_commit',{**p,'claim':claim,'replacement':'obsolete'})['status'],409)
+        self.assertEqual(self.rpc('ct_github_refresh_claim',p),{'state':'updated','encrypted_token':'reconnected'})
+        self.assertEqual(self.sql("SELECT encrypted_token FROM codeturtle_private.memberships"),'reconnected')
+
+    @unittest.skipUnless(os.environ.get('CODETURTLE_TEST_REFRESH_SQL'), 'private refresh handoff required')
+    def test_refresh_timeout_requires_reconnect_and_enforces_tenant(self):
+        _,actor=self.reviewer_session()
+        encrypted=self.sql("SELECT encrypted_token FROM codeturtle_private.memberships")
+        p={'actor':actor,'repository_id':'42','encrypted_token':encrypted}
+        self.assertEqual(self.rpc('ct_github_refresh_claim',{**p,'actor':{**actor,'tenant_id':'other'}})['status'],403)
+        self.rpc('ct_github_refresh_claim',p)
+        self.sql("UPDATE codeturtle_private.memberships SET refresh_started=now()-interval '1 minute'")
+        self.assertEqual(self.rpc('ct_github_refresh_claim',p)['error'],'github_reconnect_required')
+        for role in ('anon','authenticated'):
+            with self.assertRaises(subprocess.CalledProcessError):self.sql('SET ROLE '+role+"; SELECT public.ct_github_refresh_claim('{}');")
+
+    @unittest.skipUnless(os.environ.get('CODETURTLE_TEST_REFRESH_SQL'), 'private refresh handoff required')
+    def test_expired_github_token_refreshes_once_through_http_workspace(self):
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCMSIV
+        g,h,actor,_=self.workspace_fixture()
+        bundle={'access_token':'expired','refresh_token':'first-refresh','expires_at':int(time.time())-1,'refresh_expires_at':int(time.time())+3600}
+        sealed='00'*12+':'+AESGCMSIV(bytes(32)).encrypt(bytes(12),json.dumps(bundle).encode(),b'github-user:reviewer:42').hex()
+        self.sql("UPDATE codeturtle_private.memberships SET encrypted_token='"+sealed+"'")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            responses=list(pool.map(lambda _:self.request('/api/workspace?run='+g['run_id'],headers=h),range(2)))
+        for status,view in responses:
+            self.assertEqual(status,200,view)
+            self.assertNotIn('next-refresh',json.dumps(view))
+        self.assertEqual(self.refresh_calls,1)
+        encrypted=self.sql("SELECT encrypted_token FROM codeturtle_private.memberships WHERE user_id='reviewer'")
+        nonce,cipher=encrypted.split(':')
+        saved=json.loads(AESGCMSIV(bytes(32)).decrypt(bytes.fromhex(nonce),bytes.fromhex(cipher),b'github-user:reviewer:42'))
+        self.assertEqual(saved['access_token'],'renewed')
+        self.assertEqual(saved['refresh_token'],'next-refresh')
+
+    def test_native_review_requests_are_reconciled_on_delivery_retry(self):
+        g,h,actor,body=self.review_fixture()
+        type(self).fail_post=True
+        self.delivery()
+        self.assertEqual(self.requested_users,['one','two'])
+        self.assertEqual(self.native_requests,1)
+        self.sql("UPDATE codeturtle_private.deliveries SET next_at=now()")
+        self.delivery()
+        self.assertEqual(self.native_requests,1)
+        self.assertEqual(self.sql('SELECT status FROM codeturtle_private.deliveries'),'delivered')
 
 if __name__=='__main__':unittest.main()

@@ -107,3 +107,10 @@ GitHub handles work without that additional permission.
 The additive reviewer database migration must be applied before deploying this
 workspace. It is supplied separately as the operator SQL handoff. Deployment and
 publishing the updated GitHub Action are separate from local build/test success.
+
+## Public release status
+
+See [public setup and remaining release prerequisites](backend/PUBLIC_SETUP.md).
+Source CI requires no app credentials. The full app still requires the private
+database handoff; it is not independently reproducible from a public clone yet.
+The `heal/` experiment cannot execute candidates until isolated testing is implemented.

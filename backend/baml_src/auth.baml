@@ -73,10 +73,28 @@ class HttpTransport {
                 } else {
                     502
                 },
-                "provider_request_failed",
+                if (r.status_code == 401 && url.starts_with("https://api.github.com/")) {
+                    "github_credentials_rejected"
+                } else {
+                    "provider_request_failed"
+                },
             );
             baml.json.parse(r.text())
         }
+    }
+}
+
+// Only user-token requests should send a reviewer through GitHub reconnection.
+// Keep app-token failures and other provider errors separate from browser login.
+function github_user_get(http: Transport, url: string, token: string) -> json {
+    http.send("GET", url, token, null) catch_all (error) {
+        let e: ApiError => {
+            if (e.code == "github_credentials_rejected") {
+                throw ApiError { status: 403, code: "github_reconnect_required" };
+            }
+            throw e
+        },
+        _ => throw error,
     }
 }
 
@@ -237,11 +255,8 @@ class BrowserAuth {
             { "actor": baml.json.from(actor), "repository_id": repository_id, "setup": setup },
         );
         let enrolled = self.store.enrollment(repository_id);
-        let token = self.secrets.open(
-            str(membership, "encrypted_token"),
-            "github-user:" + actor.user_id + ":" + repository_id,
-        );
-        let repo = self.http.send("GET", "https://api.github.com/repos/" + enrolled.repository, token, null);
+        let token = github_membership_token(self, actor, repository_id, str(membership, "encrypted_token"));
+        let repo = github_user_get(self.http, "https://api.github.com/repos/" + enrolled.repository, token);
         require(
             num(repo, "id").to_string() == repository_id
                 && (
@@ -343,4 +358,28 @@ function safe_return(path: string) -> string {
     } else {
         "/"
     }
+}
+
+class ReconnectTestTransport {
+    error_code: string,
+    implements Transport {
+        function send(self, method: string, url: string, token: string, payload: json) -> json {
+            if (self.error_code == "") { return {"id": 24}; }
+            throw ApiError {status: 502, code: self.error_code}
+        }
+    }
+}
+
+test "GitHub user credentials reconnect without masking provider failures" {
+    let rejected = github_user_get(ReconnectTestTransport {error_code: "github_credentials_rejected"}, "https://api.github.com/user", "test") catch_all (e) {
+        let error: ApiError => ({"status": error.status, "code": error.code}),
+        _ => null,
+    };
+    assert.equal(rejected, {"status": 403, "code": "github_reconnect_required"});
+    let unavailable = github_user_get(ReconnectTestTransport {error_code: "provider_request_failed"}, "https://api.github.com/user", "test") catch_all (e) {
+        let error: ApiError => ({"status": error.status, "code": error.code}),
+        _ => null,
+    };
+    assert.equal(unavailable, {"status": 502, "code": "provider_request_failed"});
+    assert.equal(github_user_get(ReconnectTestTransport {error_code: ""}, "https://api.github.com/user", "test"), {"id": 24});
 }

@@ -194,7 +194,7 @@ function setup_workflow(
     runtime_url: string,
     runtime_sha: string,
 ) -> string {
-    "name: CodeTurtle\non:\n  pull_request_target:\n    types: [opened, synchronize, reopened, edited]\npermissions:\n  contents: read\n  id-token: write\nconcurrency:\n  group: codeturtle-${{ github.event.pull_request.number }}\n  cancel-in-progress: true\njobs:\n  codeturtle:\n    runs-on: ubuntu-latest\n    timeout-minutes: 30\n    steps:\n      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          fetch-depth: 0\n          persist-credentials: false\n      - name: Fetch PR history without checking out PR code\n        env:\n          PR_NUMBER: ${{ github.event.pull_request.number }}\n          GH_TOKEN: ${{ github.token }}\n        run: |\n          auth=$(printf 'x-access-token:%s' \"$GH_TOKEN\" | base64 -w0)\n          git -c http.extraheader=\"AUTHORIZATION: basic $auth\" fetch --no-tags origin \"refs/pull/$PR_NUMBER/head\"\n      - uses: "
+    "name: CodeTurtle\non:\n  pull_request_target:\n    types: [opened, synchronize, reopened, edited, ready_for_review, labeled]\npermissions:\n  contents: read\n  id-token: write\njobs:\n  codeturtle:\n    if: github.event.action != 'labeled' || github.event.label.name == 'codeturtle-refresh'\n    concurrency:\n      group: codeturtle-${{ github.event.pull_request.number }}\n      cancel-in-progress: true\n    runs-on: ubuntu-latest\n    timeout-minutes: 30\n    steps:\n      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          fetch-depth: 0\n          persist-credentials: false\n      - name: Fetch PR history without checking out PR code\n        env:\n          PR_NUMBER: ${{ github.event.pull_request.number }}\n          GH_TOKEN: ${{ github.token }}\n        run: |\n          auth=$(printf 'x-access-token:%s' \"$GH_TOKEN\" | base64 -w0)\n          git -c http.extraheader=\"AUTHORIZATION: basic $auth\" fetch --no-tags origin \"refs/pull/$PR_NUMBER/head\"\n      - uses: "
         + action_ref
         + "\n        with:\n          api-url: '"
         + origin
@@ -333,6 +333,9 @@ test "Setup workflow uses trusted base and one job" {
     );
     assert.contains(workflow, "pull_request_target");
     assert.contains(workflow, "persist-credentials: false");
+    assert.contains(workflow, "ready_for_review, labeled");
+    assert.contains(workflow, "github.event.label.name == 'codeturtle-refresh'");
+    assert.contains(workflow, "    concurrency:");
     assert.contains(workflow, "ref: ${{ github.event.pull_request.base.sha }}")
 }
 
@@ -455,7 +458,7 @@ function complete_setup(
                 "repository_id": repository_id,
                 "installation_id": installation_id,
                 "github_user_id": num(user, "id").to_string(),
-                "encrypted_token": secrets.seal(token, "github-user:" + actor.user_id + ":" + repository_id),
+                "encrypted_token": secrets.seal(github_token_bundle(exchange), "github-user:" + actor.user_id + ":" + repository_id),
             },
         );
         return redirect(safe_return(baml.json.to<string?>(field(data, "next")) ?? "/"));
@@ -485,7 +488,7 @@ function complete_setup(
             "actor": baml.json.from(actor),
             "enrollment": baml.json.from(enrolled),
             "github_user_id": num(user, "id").to_string(),
-            "encrypted_token": secrets.seal(token, "github-user:" + actor.user_id + ":" + repository_id),
+            "encrypted_token": secrets.seal(github_token_bundle(exchange), "github-user:" + actor.user_id + ":" + repository_id),
         },
     );
     redirect("/?repository=" + repository_id)

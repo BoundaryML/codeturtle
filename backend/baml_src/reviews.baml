@@ -98,7 +98,7 @@ function reviewer_identity(
 }
 
 function reviewer_with_token(auth: BrowserAuth, run: StoredRun, token: string) -> ReviewIdentity {
-    let user = auth.http.send("GET", "https://api.github.com/user", token, null);
+    let user = github_user_get(auth.http, "https://api.github.com/user", token);
     let login = str(user, "login").to_lower_case();
     let eligible = ["@" + login];
     let e = run.envelope;
