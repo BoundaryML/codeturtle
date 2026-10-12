@@ -238,3 +238,6 @@ plans/.reviews/
 
 # Database provisioning stays in the private operator handoff
 /backend/migrations/
+
+# Generated local benchmark output
+/backend/performance/

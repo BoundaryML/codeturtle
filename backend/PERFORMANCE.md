@@ -42,7 +42,7 @@ The UI harness prints a loopback-only URL backed by disposable PostgreSQL, real 
 
 ## Measured locally, 2026-10-09
 
-`performance/local-results.json` contains the isolated API benchmark: 30 samples per endpoint/concurrency level; one-file API fixture, real local BAML/Postgres and loopback GitHub transport. These are **not Fly/Supabase production latency measurements**.
+The local benchmark output is excluded from Git. The measurements below came from an isolated API benchmark: 30 samples per endpoint/concurrency level; one-file API fixture, real local BAML/Postgres and loopback GitHub transport. These are **not Fly/Supabase production latency measurements**.
 
 | Warm endpoint | p95, 1 concurrent | p95, 5 concurrent | p95, 20 concurrent |
 |---|---:|---:|---:|
