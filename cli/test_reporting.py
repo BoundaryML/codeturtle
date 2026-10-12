@@ -24,6 +24,15 @@ class ReportingTests(unittest.TestCase):
         self.reporter = reporting.Reporter(self.env)
         self.grant = {'identity': self.reporter.identity, 'run_id':'12345678-1234-1234-1234-123456789abc','token':'t'*64,'expires_at':int(time.time())+900,'merge_base':'c'*40,'title':'PR'}
 
+    def test_evaluation_exit_code(self):
+        report = {"evaluation_complete": False, "requirements": [], "errors": [],
+                  "unowned_files": ["baml_language/sdks/cpp/bridge_cpp/include/baml/detail/proto.h"]}
+        self.assertEqual(git_input.evaluation_exit_code(report), 0)
+        self.assertEqual(git_input.evaluation_exit_code(dict(report, errors=[{"message": "Bad policy"}])), 1)
+        self.assertEqual(git_input.evaluation_exit_code(dict(report, requirements=[{"path": "stdlib/x"}])), 1)
+        self.assertEqual(git_input.evaluation_exit_code(dict(report, evaluation_complete=True, requirements=[{"path": "stdlib/x"}])), 0)
+        self.assertEqual(git_input.evaluation_exit_code({}), 1)
+
     def test_context(self):
         self.assertEqual(self.reporter.identity['base'],'b'*40)
         for key, value in [('GITHUB_EVENT_NAME','pull_request'),('GITHUB_REPOSITORY_ID','43'),('GITHUB_RUN_ATTEMPT','0')]:
