@@ -12,6 +12,15 @@ class ReportService {
         validate_identity(identity);
         let claims = self.oidc.verify(bearer(request), identity);
         let enrolled = self.store.enrollment(identity.repository_id);
+        if (enrolled.workflow_blob == "") {
+            require(enrolled.active && enrolled.repository == identity.repository
+                && str(claims, "workflow_ref") == enrolled.workflow_ref
+                && str(claims, "workflow_sha") == identity.base, 403, "untrusted_workflow");
+            if let onboarding: Onboarding = self.onboarding {
+                let _ = onboarding.activate_setup(identity.repository_id);
+                enrolled = self.store.enrollment(identity.repository_id);
+            }
+        }
         let authorized = self.github.authorize(identity, claims, enrolled);
         let token = secret();
         let stored = self.store.register(authorized, sha256(token), now() + 900);
@@ -39,9 +48,11 @@ class ReportService {
         }
         let envelope = baml.json.from_string<ReportEnvelope>(request.body);
         validate_envelope(envelope, stored, self.parser);
-        self.github.check_current(stored.authorized);
+        let pr = self.github.current_pr(stored.authorized.identity, self.github.installation_token(stored.authorized.enrollment));
         //# Receipt follows the durable report/outbox transaction.
-        self.receipt(self.store.accept(id, token_hash, digest, envelope))
+        let accepted = self.store.accept(id, token_hash, digest, envelope);
+        trace_review_report(accepted, str(field(pr, "user"), "login")) catch_all (_) { _ => log.warn("Review telemetry unavailable") };
+        self.receipt(accepted)
     }
     function receipt(self, run: StoredRun) -> baml.http.Response {
         response(
@@ -84,10 +95,18 @@ class ReportService {
         if (route == "/webhooks/github" && req.method == "POST") {
             let result = receive_webhook(req, self.store, config("CODETURTLE_GITHUB_WEBHOOK_SECRET"));
             let event = req.headers.get("x-github-event") ?? "";
+            if (event == "pull_request") { invalidate_bot_review(self.github, self.store, baml.json.parse(req.body)); }
             if (event == "installation" || event == "installation_repositories") { self.github.tokens.clear(); }
             return result;
         }
         if let browser: BrowserAuth = self.browser {
+            if (route == "/auth/logout" && req.method == "POST") {
+                let _ = browser.session(req, mutation = true);
+                let _ = self.store.rpc("session_revoke", {"token_hash": sha256(cookie(req, "__Host-ct_session"))});
+                let result = response(200, {"signed_out": true});
+                result.headers["set-cookie"] = "__Host-ct_session=; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=0";
+                return result;
+            }
             if (route == "/auth/login" && req.method == "GET") {
                 return browser.login(req);
             }
@@ -296,6 +315,8 @@ class ReportService {
                         workspace_file(self.github, run, file) catch_all (_) { _ => null };
                     }
                 }
+                sync_bot_review(self.github, run, self.origin,
+                    baml.json.to<ReviewDecision[]>(self.store.rpc("review_decisions", {"id": run.id})));
                 baml.json.from(
                     self.github.upsert_pr_comment(
                         run,

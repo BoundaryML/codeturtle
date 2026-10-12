@@ -62,8 +62,11 @@ class GitHubClient {
             403,
             "run_mismatch",
         );
+        // GitHub can omit associations for pull_request_target runs. The run head
+        // and current PR head/base are still verified independently below.
+        let associations = baml.json.to<json[]>(field(run, "pull_requests"));
         require(
-            baml.json.to<json[]>(field(run, "pull_requests")).some((p) -> {
+            associations.length() == 0 || associations.some((p) -> {
                 num(p, "number") == i.pr
                     && num(field(field(p, "base"), "repo"), "id").to_string() == i.repository_id
             }),
@@ -198,6 +201,9 @@ function github_report(run: StoredRun, origin: string, decisions: ReviewDecision
     if (e.setup_failure != null) {
         return text
             + "Evaluation setup failed. See the CI run for details. Human approval has not been determined.";
+    }
+    if (no_review_required(e.report)) {
+        return text + "No files match the configured review rules. No CodeTurtle review required";
     }
     let complete = baml.json.to<bool>(field(e.report, "evaluation_complete"));
     text
@@ -381,4 +387,22 @@ function native_review_requests(owners: string[], author: string, organization: 
 
 test "Native requests omit author duplicates existing and foreign teams" {
     assert.equal(native_review_requests(["@ATX24", "@alice", "@ALICE", "@bob", "@BoundaryML/core", "@elsewhere/core", "@"], "atx24", "BoundaryML", ["bob"], []), {"reviewers": ["alice"], "team_reviewers": ["core"]})
+}
+
+// An empty assignment list is safe to describe as out of scope only when
+// evaluation succeeded without errors. Setup failures are handled separately.
+function no_review_required(report: json) -> bool {
+    if (report == null) { return false; }
+    let requirements = baml.json.to<json[]?>(field(report, "requirements"));
+    let errors = baml.json.to<json[]?>(field(report, "errors"));
+    if (requirements == null || errors == null) { return false; }
+    requirements.length() == 0 && errors.length() == 0
+}
+
+test "No-review message excludes failed partial and missing reports" {
+    assert.equal(no_review_required({"requirements": [], "errors": [], "unowned_files": ["docs/intro.md"], "evaluation_complete": false}), true);
+    assert.equal(no_review_required({"requirements": [], "errors": [{"message": "Invalid policy"}]}), false);
+    assert.equal(no_review_required({"requirements": [{"path": "src/main.rs"}], "errors": [], "unowned_files": ["docs/intro.md"]}), false);
+    assert.equal(no_review_required(null), false);
+    assert.equal(no_review_required({"requirements": []}), false)
 }

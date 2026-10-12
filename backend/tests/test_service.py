@@ -40,6 +40,7 @@ class ServiceTests(unittest.TestCase):
         cls.sql('CREATE DATABASE '+cls.db,database='postgres')
         sql=Path(sql_path).read_text();sql=sql.split('```sql\n')[1].split('```')[0] if '```sql' in sql else sql
         cls.sql(sql);cls.sql(sql) # setup is rerunnable
+        cls.sql("CREATE OR REPLACE FUNCTION public.ct_session_revoke(p jsonb) RETURNS jsonb LANGUAGE plpgsql AS $$ BEGIN DELETE FROM codeturtle_private.sessions WHERE token_hash=p->>'token_hash'; RETURN '{}'::jsonb; END $$;")
         review_sql_path=os.environ.get('CODETURTLE_TEST_REVIEW_SQL')
         if not review_sql_path: raise RuntimeError('Set CODETURTLE_TEST_REVIEW_SQL to the reviewer SQL update')
         update=Path(review_sql_path).read_text().split('```sql\n')[1].split('```')[0]
@@ -93,7 +94,7 @@ class ServiceTests(unittest.TestCase):
         fixture='''class FixtureTransport { url: string, implements Transport { function send(self, method: string, url: string, token: string, payload: json) -> json { let r = baml.http.send(baml.http.Request.from_url(self.url + "/provider").set_method("POST").set_body(baml.json.stringify({"method": method, "url": url, "token": token, "payload": payload}))); require(r.status_code == 200, 503, "fixture_provider_unavailable"); baml.json.parse(r.text()) } } }
 function test_main(addr: string, fixture_url: string, python: string, crypto_path: string, models_path: string, key_path: string, origin: string) -> never {
  let http = FixtureTransport {url: fixture_url}; let crypto = CryptoHelper {python: python, path: crypto_path};
- let app = ReportService {store: SupabaseStore {url: fixture_url, key: "fixture"}, github: GitHubClient {http: http, crypto: crypto, app_id: "7", private_key: baml.fs.read(key_path), bot_id: 999, tokens: bounded_cache(262144), contents: bounded_cache(16777216)}, oidc: GitHubOIDC {http: http, crypto: crypto, audience: origin}, parser: report_parser(models_path), origin: origin, slack: SlackClient {http: http, secrets: SecretBox {key: uint8array.zeroes(32)}}, browser: BrowserAuth {store: SupabaseStore {url: fixture_url, key: "fixture"}, http: http, origin: origin, client_id: "test", client_secret: "test", organization_id: "tenant", secrets: SecretBox {key: uint8array.zeroes(32)}}, onboarding: null};
+ let app = ReportService {store: SupabaseStore {url: fixture_url, key: "fixture"}, github: GitHubClient {http: http, crypto: crypto, app_id: "7", private_key: baml.fs.read(key_path), bot_id: 999, tokens: bounded_cache(262144), contents: bounded_cache(16777216)}, oidc: GitHubOIDC {http: http, crypto: crypto, audience: origin}, parser: report_parser(models_path), origin: origin, slack: SlackClient {http: http, secrets: SecretBox {key: uint8array.zeroes(32)}}, browser: BrowserAuth {store: SupabaseStore {url: fixture_url, key: "fixture"}, http: http, origin: origin, client_id: "test", client_secret: "test", organization_id: "tenant", secrets: SecretBox {key: uint8array.zeroes(32)}}, onboarding: Onboarding {auth: BrowserAuth {store: SupabaseStore {url: fixture_url, key: "fixture"}, http: http, origin: origin, client_id: "test", client_secret: "test", organization_id: "tenant", secrets: SecretBox {key: uint8array.zeroes(32)}}, github: GitHubClient {http: http, crypto: crypto, app_id: "7", private_key: baml.fs.read(key_path), bot_id: 999, tokens: bounded_cache(262144), contents: bounded_cache(16777216)}, store: SupabaseStore {url: fixture_url, key: "fixture"}, action_ref: "", runtime_url: "", runtime_sha256: ""}};
  baml.http.Server.bind(addr).serve((req) -> {app.handle(req)}, max_body_size = 4194304)
 }
 function test_delivery(fixture_url: string, python: string, crypto_path: string, models_path: string, key_path: string, origin: string) -> void {
@@ -101,7 +102,7 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
  let app = ReportService {store: SupabaseStore {url: fixture_url, key: "fixture"}, github: GitHubClient {http: http, crypto: crypto, app_id: "7", private_key: baml.fs.read(key_path), bot_id: 999, tokens: bounded_cache(262144), contents: bounded_cache(16777216)}, oidc: GitHubOIDC {http: http, crypto: crypto, audience: origin}, parser: report_parser(models_path), origin: origin, slack: SlackClient {http: http, secrets: SecretBox {key: uint8array.zeroes(32)}}, browser: BrowserAuth {store: SupabaseStore {url: fixture_url, key: "fixture"}, http: http, origin: origin, client_id: "test", client_secret: "test", organization_id: "tenant", secrets: SecretBox {key: uint8array.zeroes(32)}}, onboarding: null}; app.deliver_once()
 }'''
         (cls.project/'baml_src/fixture.baml').write_text(fixture)
-        cls.env=dict(os.environ,BAML_VERSION='0.20.2-nightly.20261004.a',CODETURTLE_FRONTEND_DIR=str(ROOT/'frontend/dist'),CODETURTLE_GITHUB_CLIENT_ID='test',CODETURTLE_GITHUB_CLIENT_SECRET='test')
+        cls.env=dict(os.environ,BAML_VERSION='0.20.2-nightly.20261004.a',CODETURTLE_FRONTEND_DIR=str(ROOT/'frontend/dist'),CODETURTLE_GITHUB_WEBHOOK_SECRET='fixture-webhook',CODETURTLE_GITHUB_CLIENT_ID='test',CODETURTLE_GITHUB_CLIENT_SECRET='test')
         cls.args=['--fixture_url',cls.mock_url,'--python',str(ROOT/'backend/.venv/bin/python'),'--crypto_path',str(ROOT/'backend/crypto.py'),'--models_path',str(ROOT/'cli/baml_src/models.baml'),'--key_path',str(cls.path/'key.pem'),'--origin',cls.origin]
         cls.log=open(cls.path/'service.log','w+');cls.addClassCleanup(cls.log.close)
         cls.start_service();cls.addClassCleanup(cls.stop_service)
@@ -162,12 +163,19 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
         if url.endswith('/access_tokens'):return {'token':'installation'}
         if url.endswith('/repos/acme/repo'):return {'id':42,'permissions':{'admin':True,'pull':True},'default_branch':'main'}
         if '/contents/' in url:return {'sha':'c'*40,'encoding':'base64','size':6,'content':__import__('base64').b64encode(('before\n' if url.endswith(cls.base) else 'after\n').encode()).decode()}
-        if '/actions/runs/' in url:return {'id':123,'run_attempt':1,'event':'pull_request_target','head_sha':cls.run_head,'path':'.github/workflows/codeturtle.yml','status':'in_progress','pull_requests':[{'number':7,'base':{'repo':{'id':42}}}]}
+        if '/actions/runs/' in url:return {'id':123,'run_attempt':1,'event':'pull_request_target','head_sha':cls.run_head,'path':'.github/workflows/codeturtle.yml','status':'in_progress','pull_requests':cls.run_associations}
+        if url.endswith('/pulls/8'):return {'state':'closed','merged':cls.setup_merged}
         if url.endswith('/pulls/7'):return {'state':'open','head':{'sha':cls.live_head},'base':{'sha':cls.base,'ref':'main','repo':{'id':42}},'title':'Test PR','draft':False,'user':{'login':'author'}}
         if '/requested_reviewers' in url:
             if method=='POST': cls.requested_users.extend(data['payload']['reviewers']);cls.native_requests+=1
             return {'users':[{'login':u} for u in cls.requested_users],'teams':[]}
-        if '/reviews?' in url:return []
+        if '/reviews?' in url:return cls.reviews
+        if '/dismissals' in url:
+            review=next(r for r in cls.reviews if r['id']==int(url.split('/')[-2]));review['state']='DISMISSED';return review
+        if url.endswith('/reviews') and method=='POST':
+            body=data['payload'];review={'id':len(cls.reviews)+1,'user':{'id':999,'login':'codeturtle[bot]'},'state':'APPROVED' if body['event']=='APPROVE' else 'COMMENTED','commit_id':body['commit_id'],'body':body['body']};cls.reviews.append(review)
+            if cls.fail_review: cls.fail_review=False;raise ValueError('response lost')
+            return review
         if '/compare/' in url:return {'merge_base_commit':{'sha':cls.base}}
         if '/comments?' in url:return cls.comments
         if '/comments' in url:
@@ -178,10 +186,12 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
             if method=='PATCH':cls.comments[0]['body']=data['payload']['body'];return cls.comments[0]
         raise ValueError(url)
     def setUp(self):
+        type(self).run_associations=[{'number':7,'base':{'repo':{'id':42}}}]
+        type(self).setup_merged=True
         type(self).picker_admin=False
         self.sql('TRUNCATE codeturtle_private.deliveries,codeturtle_private.runs,codeturtle_private.enrollments,codeturtle_private.memberships,codeturtle_private.setups CASCADE')
         literal=json.dumps(self.enrollment).replace("'","''");self.sql("INSERT INTO codeturtle_private.enrollments VALUES('42','"+literal+"')")
-        type(self).refresh_calls=0;type(self).requested_users=[];type(self).native_requests=0;type(self).provider_calls=[];type(self).comments=[];type(self).posts=0;type(self).fail_post=False;type(self).provider_down=False;type(self).live_head=self.head;type(self).run_head=self.head
+        type(self).reviews=[];type(self).fail_review=False;type(self).refresh_calls=0;type(self).requested_users=[];type(self).native_requests=0;type(self).provider_calls=[];type(self).comments=[];type(self).posts=0;type(self).fail_post=False;type(self).provider_down=False;type(self).live_head=self.head;type(self).run_head=self.head
     def request(self,path,token='',body=None,method=None,headers=None):
         raw=body if isinstance(body,bytes) else json.dumps(body).encode() if body is not None else None
         req=urllib.request.Request(self.origin+path,data=raw,method=method,headers={'Authorization':'Bearer '+token,'Content-Type':'application/json',**(headers or {})})
@@ -195,6 +205,38 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
         status,body=self.request('/v1/runs',jwt.encode(self.claims(),self.pem,algorithm='RS256',headers={'kid':'test'}),self.identity)
         self.assertEqual(status,403,body)
         self.assertEqual(body['error'],'run_mismatch')
+
+    def test_empty_run_associations_use_verified_head_and_current_pr(self):
+        type(self).run_associations=[]
+        self.register()
+        type(self).run_associations=[{'number':99,'base':{'repo':{'id':42}}}]
+        token=jwt.encode(self.claims(),self.pem,algorithm='RS256',headers={'kid':'test'})
+        status,body=self.request('/v1/runs',token,self.identity)
+        self.assertEqual(status,403,body)
+        self.assertEqual(body['error'],'missing_pr_association')
+
+    def test_first_run_activates_only_merged_matching_setup(self):
+        self.sql("UPDATE codeturtle_private.enrollments SET config=jsonb_set(config,'{workflow_blob}','\"\"')")
+        state={'pr':{'number':8},'files':{'.github/workflows/codeturtle.yml':'after\n'},'stage':'setup_pr_open'}
+        payload=json.dumps({'repository_id':'42','state':state}).replace("'","''")
+        self.sql("DELETE FROM codeturtle_private.setups WHERE repository_id='42'")
+        self.sql("SELECT public.ct_setup_save('"+payload+"'::jsonb)")
+        type(self).setup_merged=False
+        token=jwt.encode(self.claims(),self.pem,algorithm='RS256',headers={'kid':'test'})
+        status,body=self.request('/v1/runs',token,self.identity)
+        self.assertEqual(status,403,body)
+        type(self).setup_merged=True
+        state['files']['.github/workflows/codeturtle.yml']='tampered'
+        payload=json.dumps({'repository_id':'42','state':state}).replace("'","''")
+        self.sql("DELETE FROM codeturtle_private.setups WHERE repository_id='42'")
+        self.sql("SELECT public.ct_setup_save('"+payload+"'::jsonb)")
+        status,body=self.request('/v1/runs',token,self.identity)
+        self.assertEqual(status,409,body)
+        state['files']['.github/workflows/codeturtle.yml']='after\n'
+        payload=json.dumps({'repository_id':'42','state':state}).replace("'","''")
+        self.sql("DELETE FROM codeturtle_private.setups WHERE repository_id='42'")
+        self.sql("SELECT public.ct_setup_save('"+payload+"'::jsonb)")
+        self.register()
 
     def register(self,claims=None):
         token=jwt.encode(claims or self.claims(),self.pem,algorithm='RS256',headers={'kid':'test'})
@@ -239,6 +281,17 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
         env=dict(self.env,GITHUB_ACTIONS='true',GITHUB_EVENT_NAME='pull_request_target',GITHUB_EVENT_PATH=str(event_path),GITHUB_REPOSITORY='acme/repo',GITHUB_REPOSITORY_ID='42',GITHUB_RUN_ID='123',GITHUB_RUN_ATTEMPT='1',ACTIONS_ID_TOKEN_REQUEST_URL=self.mock_url+'/oidc',ACTIONS_ID_TOKEN_REQUEST_TOKEN='fixture',CODETURTLE_API_URL=self.origin,CODETURTLE_TEST_LOOPBACK='1')
         r=subprocess.run(['python3',str(ROOT/'cli/git_input.py'),'check','--report','--repo',str(self.repo),'--mode','json'],env=env,capture_output=True,text=True)
         self.assertEqual(r.returncode,0,r.stdout+r.stderr);self.assertTrue(json.loads(r.stdout)['evaluation_complete']);self.assertIn('accepted report',r.stderr)
+        # Follow the accepted CLI report through delivery and the browser review APIs.
+        run_id=self.sql('SELECT id FROM codeturtle_private.runs LIMIT 1')
+        self.delivery();self.assertEqual(self.posts,1)
+        headers,_=self.reviewer_session()
+        status,page=self.request('/api/review?run='+run_id,headers=headers)
+        self.assertEqual(status,200,page)
+        self.assertEqual(page['total_requirements'],1)
+        self.assertEqual(page['completed_requirements'],0)
+        self.assertTrue(page['current'])
+        status,diff=self.request('/api/review/diff?run='+run_id+'&index=0',headers=headers)
+        self.assertEqual(status,200,diff);self.assertIn('+after',diff['patch'])
     def delivery(self):self.command(['baml','--agent-skill-check','off','run','--project',str(self.project),'test_delivery','--',*self.args],env=self.env)
     def test_lost_provider_response_reconciles(self):
         g=self.register();self.assertEqual(self.upload(g,self.envelope(g))[0],202)
@@ -253,7 +306,7 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
     def test_supersession_preserves_live_lease(self):
         g=self.register();self.upload(g,self.envelope(g));lease=self.rpc('ct_lease',{})
         identity=dict(self.identity,run_attempt=2)
-        authorized={'identity':identity,'enrollment':self.enrollment,'merge_base':self.base,'title':'Test PR'}
+        authorized={'identity':identity,'enrollment':self.enrollment,'merge_base':self.base,'title':'Test PR','draft':False,'user':{'login':'author'}}
         newer=self.rpc('ct_register',{'authorized':authorized,'token_hash':'new','expires_at':int(time.time())+900})
         envelope=self.envelope(g);envelope['identity']=identity;envelope['run_id']=newer['id']
         self.rpc('ct_accept',{'id':newer['id'],'token_hash':'new','digest':'new-digest','envelope':envelope})
@@ -686,6 +739,7 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
         self.assertEqual(self.native_requests,1)
         self.assertEqual(self.sql('SELECT status FROM codeturtle_private.deliveries'),'delivered')
 
+
     def test_repository_picker_oauth_discovery_csrf_and_live_access(self):
         import urllib.parse
         headers,actor=self.reviewer_session()
@@ -711,11 +765,84 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
         self.assertNotIn('access_token',json.dumps(data))
         self.assertEqual(self.request('/api/github/repositories',body={'repository_id':'42'},headers={'Cookie':headers['Cookie']})[0],403)
         self.assertEqual(self.request('/api/github/repositories',body={'repository_id':'999'},headers=headers)[0],403)
+        type(self).setup_merged=True
         type(self).picker_admin=False
         self.assertEqual(self.request('/api/github/repositories',body={'repository_id':'42'},headers=headers)[0],403)
         type(self).picker_admin=True
         status,data=self.request('/api/github/repositories',body={'repository_id':'42'},headers=headers)
         self.assertEqual((status,data),(200,{'repository_id':'42'}))
         self.assertEqual(self.sql("SELECT can_setup FROM codeturtle_private.memberships WHERE user_id='reviewer'"),'t')
+
+    def test_logout_requires_csrf_and_invalidates_session(self):
+        headers,_=self.reviewer_session()
+        self.assertEqual(self.request('/auth/logout',body={},headers={'Cookie':headers['Cookie']})[0],403)
+        self.assertEqual(self.request('/api/session',headers=headers)[0],200)
+        self.assertEqual(self.request('/auth/logout',body={},headers=headers),(200,{'signed_out':True}))
+        self.assertEqual(self.request('/api/session',headers=headers)[0],401)
+
+    def test_unmatched_pr_comment_has_no_empty_reviewer_table(self):
+        grant=self.register();envelope=self.envelope(grant)
+        envelope['report']['unowned_files']=['docs/intro.md']
+        envelope['report']['evaluation_complete']=False
+        self.assertEqual(self.upload(grant,envelope)[0],202)
+        self.delivery()
+        body=self.comments[0]['body']
+        self.assertIn('No files match the configured review rules. No CodeTurtle review required',body)
+        self.assertNotIn('| Reviewer |',body)
+        self.assertNotIn('0/0',body)
+        self.assertNotIn('Evaluation incomplete',body)
+
+
+
+    def approve_fixture_file(self):
+        g,h,actor,b=self.workspace_fixture()
+        # This fixture uses Any so @one can satisfy the single file.
+        self.sql("UPDATE codeturtle_private.runs SET envelope=jsonb_set(envelope,'{report,requirements,0,approval}','\"Any\"')")
+        self.assertEqual(self.request('/api/workspace',body=b,headers=h)[0],200)
+        self.assertEqual(self.request('/api/workspace',body=dict(b,action='submit'),headers=h)[0],200)
+        return g,h,b
+
+    def test_native_bot_approves_only_after_all_file_requirements(self):
+        g,h,actor,b=self.workspace_fixture()
+        self.delivery()
+        self.assertEqual([r['state'] for r in self.reviews],['COMMENTED'])
+        self.assertEqual(self.request('/api/workspace',body=b,headers=h)[0],200)
+        self.assertEqual(self.request('/api/workspace',body=dict(b,action='submit'),headers=h)[0],200)
+        self.delivery()
+        self.assertEqual([r['state'] for r in self.reviews],['COMMENTED']) # @two is still required.
+        self.sql("UPDATE codeturtle_private.runs SET envelope=jsonb_set(envelope,'{report,requirements,0,approval}','\"Any\"')")
+        self.sql("UPDATE codeturtle_private.deliveries SET status='pending',next_at=now()")
+        self.delivery()
+        self.assertEqual([r['state'] for r in self.reviews],['COMMENTED','APPROVED'])
+        self.assertEqual(self.reviews[-1]['commit_id'],self.head)
+
+    def test_native_approval_reconciles_lost_response(self):
+        self.approve_fixture_file();type(self).fail_review=True
+        self.delivery()
+        self.assertEqual([r['state'] for r in self.reviews],['APPROVED'])
+        self.sql("UPDATE codeturtle_private.deliveries SET next_at=now()")
+        self.delivery()
+        self.assertEqual(len(self.reviews),1)
+        self.assertEqual(self.sql('SELECT status FROM codeturtle_private.deliveries'),'delivered')
+
+    def test_native_approval_withdrawn_after_rejection(self):
+        g,h,b=self.approve_fixture_file();self.delivery()
+        decision=b['draft']['decisions'][0];decision.update(id=str(uuid.uuid4()),kind='changes',body='Needs a fix')
+        self.assertEqual(self.request('/api/workspace',body=b,headers=h)[0],200)
+        self.assertEqual(self.request('/api/workspace',body=dict(b,action='submit'),headers=h)[0],200)
+        self.delivery()
+        self.assertEqual([r['state'] for r in self.reviews],['DISMISSED','COMMENTED'])
+
+    def test_native_approval_dismissed_on_signed_head_change(self):
+        import hashlib,hmac
+        self.approve_fixture_file();self.delivery()
+        # Never touch a different bot's review, even with a copied marker.
+        other=dict(self.reviews[0],id=99,user={'id':123});self.reviews.append(other)
+        type(self).live_head='f'*40
+        body=json.dumps({'action':'synchronize','number':7,'repository':{'id':42},'pull_request':{'head':{'sha':self.live_head},'base':{'sha':self.base},'state':'open'}}).encode()
+        headers={'X-GitHub-Event':'pull_request','X-GitHub-Delivery':str(uuid.uuid4()),'X-Hub-Signature-256':'sha256='+hmac.new(b'fixture-webhook',body,hashlib.sha256).hexdigest()}
+        self.assertEqual(self.request('/webhooks/github',body=body,headers=headers)[0],200)
+        self.assertEqual(self.reviews[0]['state'],'DISMISSED');self.assertEqual(other['state'],'APPROVED')
+
 
 if __name__=='__main__':unittest.main()

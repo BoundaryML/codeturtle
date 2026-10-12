@@ -102,6 +102,9 @@ class Onboarding {
     }
     function verify_setup(self, req: baml.http.ServerRequest, repository_id: string) -> json {
         let _ = self.auth.authorize(req, repository_id);
+        self.activate_setup(repository_id)
+    }
+    function activate_setup(self, repository_id: string) -> json {
         let e = self.store.enrollment(repository_id);
         let state = self.store.rpc("setup_get", { "repository_id": repository_id });
         if (state == null) {
