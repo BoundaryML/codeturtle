@@ -845,4 +845,13 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
         self.assertEqual(self.reviews[0]['state'],'DISMISSED');self.assertEqual(other['state'],'APPROVED')
 
 
+    def test_completed_workflow_job_requires_valid_signature(self):
+        import hmac, hashlib
+        body=json.dumps({'action':'completed','repository':{'id':42},'workflow_job':{'name':'codeturtle','run_id':123,'run_attempt':1,'head_sha':self.head,'conclusion':'failure','html_url':'https://github.com/acme/repo/actions/runs/123/job/1','started_at':'2026-10-12T19:23:00Z','completed_at':'2026-10-12T19:23:13Z'}}).encode()
+        headers={'X-GitHub-Event':'workflow_job','X-GitHub-Delivery':str(uuid.uuid4()),'X-Hub-Signature-256':'sha256=bad'}
+        self.assertEqual(self.request('/webhooks/github',body=body,headers=headers)[0],401)
+        headers['X-Hub-Signature-256']='sha256='+hmac.new(b'fixture-webhook',body,hashlib.sha256).hexdigest()
+        self.assertEqual(self.request('/webhooks/github',body=body,headers=headers)[0],200)
+
+
 if __name__=='__main__':unittest.main()

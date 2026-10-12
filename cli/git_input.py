@@ -398,6 +398,15 @@ def lint(args):
         return run_baml(["--repo", str(snapshot)], target="lint_policy")
 
 
+def evaluation_exit_code(report):
+    """Unmatched-only changes need no review; errors and partial coverage still fail."""
+    errors = report.get("errors")
+    requirements = report.get("requirements")
+    if errors is None or requirements is None or errors:
+        return 1
+    return 0 if report.get("evaluation_complete") is True or requirements == [] else 1
+
+
 def main():
     args = parse_arguments(sys.argv[1:])
     if args is None:
@@ -456,11 +465,13 @@ def main():
                 input_path.write_text(json.dumps(data))
                 report = evaluate(snapshot, input_path, args.concurrency)
                 report["context"] = context
+        exit_code = evaluation_exit_code(report)
+        report["cli_exit_code"] = exit_code
         emit(report, args.mode)
         if reporter:
             receipt = reporter.upload(report=report)
             print("CodeTurtle accepted report: " + receipt["status_url"], file=sys.stderr)
-        return 0 if report["evaluation_complete"] else 1
+        return exit_code
     except ReportingError as error:
         print("CodeTurtle reporting error: " + str(error), file=sys.stderr)
         return 3

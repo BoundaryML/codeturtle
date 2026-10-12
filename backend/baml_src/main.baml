@@ -95,6 +95,7 @@ class ReportService {
         if (route == "/webhooks/github" && req.method == "POST") {
             let result = receive_webhook(req, self.store, config("CODETURTLE_GITHUB_WEBHOOK_SECRET"));
             let event = req.headers.get("x-github-event") ?? "";
+            if (event == "workflow_job") { trace_workflow_job(self.store, baml.json.parse(req.body)); }
             if (event == "pull_request") { invalidate_bot_review(self.github, self.store, baml.json.parse(req.body)); }
             if (event == "installation" || event == "installation_repositories") { self.github.tokens.clear(); }
             return result;
