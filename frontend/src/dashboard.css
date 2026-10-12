@@ -3,7 +3,7 @@
 .dashboard a, .prbar a, .github-comment-body a { color: var(--accent); }
 .dashboard a { display: inline-block; margin: 8px 20px 8px 0; }
 .dashboard label { display: block; margin: 20px 0; }
-.dashboard input { display: block; width: 100%; margin-top: 8px; padding: 12px; font: inherit; color: inherit; background: #121113; border: 1px solid var(--border); border-radius: 6px; }
+.dashboard input, .dashboard select { display: block; width: 100%; margin-top: 8px; padding: 12px; font: inherit; color: inherit; background: #121113; border: 1px solid var(--border); border-radius: 6px; }
 .dashboard button { padding: 10px 16px; margin: 8px 12px 8px 0; border: 1px solid var(--border); border-radius: 6px; background: #30272a; }
 .dashboard pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .dashboard .error { color: var(--red); }

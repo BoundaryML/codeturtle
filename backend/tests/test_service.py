@@ -93,12 +93,12 @@ class ServiceTests(unittest.TestCase):
         fixture='''class FixtureTransport { url: string, implements Transport { function send(self, method: string, url: string, token: string, payload: json) -> json { let r = baml.http.send(baml.http.Request.from_url(self.url + "/provider").set_method("POST").set_body(baml.json.stringify({"method": method, "url": url, "token": token, "payload": payload}))); require(r.status_code == 200, 503, "fixture_provider_unavailable"); baml.json.parse(r.text()) } } }
 function test_main(addr: string, fixture_url: string, python: string, crypto_path: string, models_path: string, key_path: string, origin: string) -> never {
  let http = FixtureTransport {url: fixture_url}; let crypto = CryptoHelper {python: python, path: crypto_path};
- let app = ReportService {store: SupabaseStore {url: fixture_url, key: "fixture"}, github: GitHubClient {http: http, crypto: crypto, app_id: "test", private_key: baml.fs.read(key_path), bot_id: 999, tokens: bounded_cache(262144), contents: bounded_cache(16777216)}, oidc: GitHubOIDC {http: http, crypto: crypto, audience: origin}, parser: report_parser(models_path), origin: origin, slack: SlackClient {http: http, secrets: SecretBox {key: uint8array.zeroes(32)}}, browser: BrowserAuth {store: SupabaseStore {url: fixture_url, key: "fixture"}, http: http, origin: origin, client_id: "test", client_secret: "test", organization_id: "tenant", secrets: SecretBox {key: uint8array.zeroes(32)}}, onboarding: null};
+ let app = ReportService {store: SupabaseStore {url: fixture_url, key: "fixture"}, github: GitHubClient {http: http, crypto: crypto, app_id: "7", private_key: baml.fs.read(key_path), bot_id: 999, tokens: bounded_cache(262144), contents: bounded_cache(16777216)}, oidc: GitHubOIDC {http: http, crypto: crypto, audience: origin}, parser: report_parser(models_path), origin: origin, slack: SlackClient {http: http, secrets: SecretBox {key: uint8array.zeroes(32)}}, browser: BrowserAuth {store: SupabaseStore {url: fixture_url, key: "fixture"}, http: http, origin: origin, client_id: "test", client_secret: "test", organization_id: "tenant", secrets: SecretBox {key: uint8array.zeroes(32)}}, onboarding: null};
  baml.http.Server.bind(addr).serve((req) -> {app.handle(req)}, max_body_size = 4194304)
 }
 function test_delivery(fixture_url: string, python: string, crypto_path: string, models_path: string, key_path: string, origin: string) -> void {
  let http = FixtureTransport {url: fixture_url}; let crypto = CryptoHelper {python: python, path: crypto_path};
- let app = ReportService {store: SupabaseStore {url: fixture_url, key: "fixture"}, github: GitHubClient {http: http, crypto: crypto, app_id: "test", private_key: baml.fs.read(key_path), bot_id: 999, tokens: bounded_cache(262144), contents: bounded_cache(16777216)}, oidc: GitHubOIDC {http: http, crypto: crypto, audience: origin}, parser: report_parser(models_path), origin: origin, slack: SlackClient {http: http, secrets: SecretBox {key: uint8array.zeroes(32)}}, browser: BrowserAuth {store: SupabaseStore {url: fixture_url, key: "fixture"}, http: http, origin: origin, client_id: "test", client_secret: "test", organization_id: "tenant", secrets: SecretBox {key: uint8array.zeroes(32)}}, onboarding: null}; app.deliver_once()
+ let app = ReportService {store: SupabaseStore {url: fixture_url, key: "fixture"}, github: GitHubClient {http: http, crypto: crypto, app_id: "7", private_key: baml.fs.read(key_path), bot_id: 999, tokens: bounded_cache(262144), contents: bounded_cache(16777216)}, oidc: GitHubOIDC {http: http, crypto: crypto, audience: origin}, parser: report_parser(models_path), origin: origin, slack: SlackClient {http: http, secrets: SecretBox {key: uint8array.zeroes(32)}}, browser: BrowserAuth {store: SupabaseStore {url: fixture_url, key: "fixture"}, http: http, origin: origin, client_id: "test", client_secret: "test", organization_id: "tenant", secrets: SecretBox {key: uint8array.zeroes(32)}}, onboarding: null}; app.deliver_once()
 }'''
         (cls.project/'baml_src/fixture.baml').write_text(fixture)
         cls.env=dict(os.environ,BAML_VERSION='0.20.2-nightly.20261004.a',CODETURTLE_FRONTEND_DIR=str(ROOT/'frontend/dist'),CODETURTLE_GITHUB_CLIENT_ID='test',CODETURTLE_GITHUB_CLIENT_SECRET='test')
@@ -155,7 +155,8 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
                 if cls.refresh_calls>1: raise ValueError('single use token replayed')
                 return {'access_token':'renewed','refresh_token':'next-refresh','expires_in':28800,'refresh_token_expires_in':15897600}
             return {'access_token':'reader'}
-        if '/user/installations/' in url:return {'repositories':[{'id':42,'full_name':'acme/repo','permissions':{'admin':False,'pull':True},'default_branch':'main'}]}
+        if url.startswith('https://api.github.com/user/installations?'):return {'installations':[{'id':9,'app_id':7,'suspended_at':None}]}
+        if '/user/installations/' in url:return {'repositories':[{'id':42,'full_name':'acme/repo','permissions':{'admin':getattr(cls,'picker_admin',False),'pull':True},'default_branch':'main'}]}
         if '/compare/' in url and '?' in url:return {'files':[{'filename':'a.txt','sha':'d'*40,'status':'modified','additions':1,'deletions':1,'patch':'@@ -1 +1 @@\n-before\n+after'}]}
         if url.endswith('/.well-known/jwks'):return {'keys':[cls.jwk]}
         if url.endswith('/access_tokens'):return {'token':'installation'}
@@ -177,6 +178,7 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
             if method=='PATCH':cls.comments[0]['body']=data['payload']['body'];return cls.comments[0]
         raise ValueError(url)
     def setUp(self):
+        type(self).picker_admin=False
         self.sql('TRUNCATE codeturtle_private.deliveries,codeturtle_private.runs,codeturtle_private.enrollments,codeturtle_private.memberships,codeturtle_private.setups CASCADE')
         literal=json.dumps(self.enrollment).replace("'","''");self.sql("INSERT INTO codeturtle_private.enrollments VALUES('42','"+literal+"')")
         type(self).refresh_calls=0;type(self).requested_users=[];type(self).native_requests=0;type(self).provider_calls=[];type(self).comments=[];type(self).posts=0;type(self).fail_post=False;type(self).provider_down=False;type(self).live_head=self.head;type(self).run_head=self.head
@@ -683,5 +685,37 @@ function test_delivery(fixture_url: string, python: string, crypto_path: string,
         self.delivery()
         self.assertEqual(self.native_requests,1)
         self.assertEqual(self.sql('SELECT status FROM codeturtle_private.deliveries'),'delivered')
+
+    def test_repository_picker_oauth_discovery_csrf_and_live_access(self):
+        import urllib.parse
+        headers,actor=self.reviewer_session()
+        self.assertEqual(self.request('/api/github/repositories',headers=headers)[0],403)
+        status,redirect,_=self.auth_request('/auth/github/start',headers['Cookie'])
+        self.assertEqual(status,302)
+        state=urllib.parse.parse_qs(urllib.parse.urlsplit(redirect['location']).query)['state'][0]
+        cookie=headers['Cookie']+'; '+redirect['set-cookie'].split(';')[0]
+        callback='/auth/github/callback?state='+state+'&code=valid'
+        status,redirect,_=self.auth_request(callback,cookie)
+        self.assertEqual(status,302)
+        self.assertEqual(redirect['location'],'/?connect=github')
+        self.assertIn('HttpOnly',redirect['set-cookie'])
+        self.assertIn('Max-Age=600',redirect['set-cookie'])
+        headers['Cookie']+='; '+redirect['set-cookie'].split(';')[0]
+        self.assertEqual(self.auth_request(callback,cookie)[0],403)
+        status,data=self.request('/api/github/repositories',headers=headers)
+        self.assertEqual((status,data),(200,{'repositories':[]}))
+        type(self).picker_admin=True
+        status,data=self.request('/api/github/repositories',headers=headers)
+        self.assertEqual(status,200,data)
+        self.assertEqual(data['repositories'][0]['name'],'acme/repo')
+        self.assertNotIn('access_token',json.dumps(data))
+        self.assertEqual(self.request('/api/github/repositories',body={'repository_id':'42'},headers={'Cookie':headers['Cookie']})[0],403)
+        self.assertEqual(self.request('/api/github/repositories',body={'repository_id':'999'},headers=headers)[0],403)
+        type(self).picker_admin=False
+        self.assertEqual(self.request('/api/github/repositories',body={'repository_id':'42'},headers=headers)[0],403)
+        type(self).picker_admin=True
+        status,data=self.request('/api/github/repositories',body={'repository_id':'42'},headers=headers)
+        self.assertEqual((status,data),(200,{'repository_id':'42'}))
+        self.assertEqual(self.sql("SELECT can_setup FROM codeturtle_private.memberships WHERE user_id='reviewer'"),'t')
 
 if __name__=='__main__':unittest.main()

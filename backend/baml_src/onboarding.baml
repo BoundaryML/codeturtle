@@ -364,7 +364,7 @@ function start_setup(
         q.get("repository_id") ?? ""
     };
     require(
-        matches(installation, "^[1-9][0-9]*$") && matches(repository, "^[1-9][0-9]*$"),
+        (installation == "" && repository == "") || (matches(installation, "^[1-9][0-9]*$") && matches(repository, "^[1-9][0-9]*$")),
         400,
         "installation_and_repository_required",
     );
@@ -424,6 +424,14 @@ function complete_setup(
     let user = github.http.send("GET", "https://api.github.com/user", token, null);
     let installation_id = str(data, "installation_id");
     let repository_id = str(data, "repository_id");
+    if (installation_id == "" && repository_id == "") {
+        let credential = secrets.seal(
+            baml.json.stringify({"bundle": github_token_bundle(exchange), "expires_at": now() + 600}),
+            "github-picker:" + str(session, "csrf"),
+        );
+        require(credential.length() < 3800, 503, "github_credential_too_large");
+        return redirect("/?connect=github", set_cookie = "__Host-ct_picker=" + credential + "; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=600");
+    }
     let page = 1;
     let selected: json = null;
     while (page <= 100) {
@@ -492,4 +500,73 @@ function complete_setup(
         },
     );
     redirect("/?repository=" + repository_id)
+}
+
+// Discovery credentials are encrypted, short-lived, and bound to this browser session.
+function picker_bundle(auth: BrowserAuth, req: baml.http.ServerRequest, session: json) -> string {
+    let encrypted = cookie(req, "__Host-ct_picker");
+    require(encrypted != "", 403, "github_connect_required");
+    let data = baml.json.parse(auth.secrets.open(encrypted, "github-picker:" + str(session, "csrf"))) catch_all (_) {
+        _ => throw ApiError {status: 403, code: "github_connect_required"},
+    };
+    require(num(data, "expires_at") > now(), 403, "github_connect_required");
+    str(data, "bundle")
+}
+
+function discover_repositories(http: Transport, token: string, app_id: string) -> json[] {
+    let found: json[] = [];
+    let page = 1;
+    while (page <= 100) {
+        let data = github_user_get(http, `https://api.github.com/user/installations?per_page=100&page=${page}`, token);
+        let installations = baml.json.to<json[]>(field(data, "installations"));
+        for (let installation in installations) {
+            if (num(installation, "app_id").to_string() == app_id && field(installation, "suspended_at") == null) {
+                let installation_id = num(installation, "id").to_string();
+                let repo_page = 1;
+                while (repo_page <= 100) {
+                    let result = github_user_get(http, `https://api.github.com/user/installations/${installation_id}/repositories?per_page=100&page=${repo_page}`, token);
+                    let repos = baml.json.to<json[]>(field(result, "repositories"));
+                    for (let repo in repos) {
+                        if (field(field(repo, "permissions"), "admin") == true && field(repo, "archived") != true) {
+                            found.push({"id": num(repo, "id").to_string(), "name": str(repo, "full_name"), "installation_id": installation_id, "default_branch": str(repo, "default_branch")});
+                        }
+                    }
+                    if (repos.length() < 100) { break; }
+                    repo_page += 1;
+                }
+            }
+        }
+        if (installations.length() < 100) { break; }
+        page += 1;
+    }
+    found
+}
+
+function repository_picker(auth: BrowserAuth, req: baml.http.ServerRequest, github: GitHubClient) -> json {
+    let session = auth.session(req, mutation = req.method == "POST");
+    let bundle = picker_bundle(auth, req, session);
+    let token = str(baml.json.parse(bundle), "access_token");
+    //# Discover repositories the signed-in user can administer through this app.
+    let repositories = discover_repositories(github.http, token, github.app_id);
+    if (req.method == "GET") { return {"repositories": repositories}; }
+    let body = baml.json.parse(req.body);
+    let selected = repositories.find((r) -> { str(r, "id") == str(body, "repository_id") })
+        ?? throw ApiError {status: 403, code: "repository_admin_required"};
+    let actor = baml.json.to<Actor>(field(session, "actor"));
+    let user = github_user_get(github.http, "https://api.github.com/user", token);
+    let id = str(selected, "id");
+    let repository = str(selected, "name");
+    let enrolled = Enrollment {
+        repository_id: id, repository: repository, tenant_id: actor.tenant_id,
+        installation_id: baml.Int.parse(str(selected, "installation_id")),
+        workflow_ref: repository + "/.github/workflows/codeturtle.yml@refs/heads/" + str(selected, "default_branch"),
+        workflow_blob: "", active: true, slack: null,
+    };
+    //# Recheck live access before linking the selected repository.
+    let _ = auth.store.rpc("link_repository", {
+        "actor": baml.json.from(actor), "enrollment": baml.json.from(enrolled),
+        "github_user_id": num(user, "id").to_string(),
+        "encrypted_token": auth.secrets.seal(bundle, "github-user:" + actor.user_id + ":" + id),
+    });
+    {"repository_id": id}
 }

@@ -13,5 +13,35 @@ function error(e:unknown){if(e instanceof SignInRequired)return;app.append(el('p
 function input(label:string,placeholder:string){const l=el('label',label);const i=el('input');i.placeholder=placeholder;l.append(i);return {label:l,input:i};}
 function button(text:string,action:()=>Promise<void>){const b=el('button',text);b.onclick=()=>{b.disabled=true;void action().catch(error).finally(()=>b.disabled=false);};return b;}
 async function setup(repository:string){const panel=el('section');panel.append(el('h2','Connect repository'));const state=await api<{stage:string;pr?:{url:string}}>('/api/setup?repository_id='+encodeURIComponent(repository));panel.append(el('p',state.stage.replaceAll('_',' ')));if(state.pr)panel.append(link('View setup PR',state.pr.url));const owners=input('Confirmed GitHub owners','@owner @organization/team');panel.append(owners.label);let preview:unknown=null;panel.append(button('Preview workflow and policy',async()=>{preview=await api('/api/setup',{repository_id:repository,options:{owners:owners.input.value.trim().split(/\s+/),create_pr:false}});panel.append(el('pre',JSON.stringify(preview,null,2)));panel.append(button('Create setup PR',async()=>{await api('/api/setup',{repository_id:repository,options:{owners:owners.input.value.trim().split(/\s+/),create_pr:true}});location.reload();}));}));panel.append(link('Connect Slack workspace','/auth/slack/start?repository_id='+encodeURIComponent(repository)));const channel=input('Slack channel ID','C0123456789'),owner=input('GitHub owner','@owner'),user=input('Verified Slack member ID','U0123456789');panel.append(channel.label,owner.label,user.label,button('Save owner mapping',async()=>{await api('/api/slack/mapping',{repository_id:repository,channel:channel.input.value,owner:owner.input.value,user_id:user.input.value});panel.append(el('p','Mapping saved.'));}));app.append(panel);}
-export async function dashboard(){app.classList.add('dashboard');const session=await api<Session>('/api/session');csrf=session.csrf;const q=new URLSearchParams(location.search),run=q.get('run');app.replaceChildren(el('h1','Your repositories'));for(const repo of session.repositories){const section=el('section');section.append(el('h2',repo.name));if(repo.latest_run)section.append(link('Latest report','/?run='+encodeURIComponent(repo.latest_run)));if(repo.can_setup)section.append(link('Repository setup','/?repository='+encodeURIComponent(repo.id)));app.append(section);}const selected=q.get('repository');if(selected)await setup(selected);const connect=el('section');connect.append(el('h2','Link a GitHub App installation'),el('p','Install the CodeTurtle GitHub App on selected repositories, then verify your administrator access here.'));const install=input('Installation ID','123456'),repository=input('Repository ID','123456');connect.append(install.label,repository.label,button('Verify with GitHub',async()=>{location.href='/auth/github/start?installation_id='+encodeURIComponent(install.input.value)+'&repository_id='+encodeURIComponent(repository.input.value);}));app.append(connect);}
+export async function dashboard(){app.classList.add('dashboard');const session=await api<Session>('/api/session');csrf=session.csrf;const q=new URLSearchParams(location.search),run=q.get('run');app.replaceChildren(el('h1','Your repositories'));for(const repo of session.repositories){const section=el('section');section.append(el('h2',repo.name));if(repo.latest_run)section.append(link('Latest report','/?run='+encodeURIComponent(repo.latest_run)));if(repo.can_setup)section.append(link('Repository setup','/?repository='+encodeURIComponent(repo.id)));app.append(section);}const selected=q.get('repository');if(selected)await setup(selected);await repositoryPicker(q.get('connect')==='github');}
 
+async function repositoryPicker(connected:boolean){
+  const panel=el('section');
+  panel.append(el('h2','Connect a repository'));
+  const install=link('Manage GitHub App access','https://github.com/apps/codeturtle-app/installations/new');
+  install.target='_blank';install.rel='noopener noreferrer';
+  panel.append(install);
+  app.append(panel);
+  if(!connected){
+    panel.append(el('p','Connect GitHub to choose a repository you administer.'),link('Connect GitHub','/auth/github/start'));
+    return;
+  }
+  const status=el('p','Loading repositories…');panel.append(status);
+  try{
+    const data=await api<{repositories:{id:string;name:string}[]}>('/api/github/repositories');
+    status.textContent=data.repositories.length?'Choose a repository to set up CodeTurtle.':'No available repositories. Give the GitHub App access to a repository you administer, then refresh.';
+    if(data.repositories.length){
+      const label=el('label','Repository'),select=el('select');
+      for(const repo of data.repositories.sort((a,b)=>a.name.localeCompare(b.name))){const option=el('option',repo.name);option.value=repo.id;select.append(option);}
+      label.append(select);panel.append(label,button('Continue to setup',async()=>{
+        const linked=await api<{repository_id:string}>('/api/github/repositories',{repository_id:select.value});
+        location.href='/?repository='+encodeURIComponent(linked.repository_id);
+      }));
+    }
+    panel.append(button('Refresh repositories',async()=>{panel.remove();await repositoryPicker(true);}));
+  }catch(e){
+    if(e instanceof SignInRequired)throw e;
+    status.textContent=e instanceof Error&&['github_connect_required','github_reconnect_required'].includes(e.message)?'Connect GitHub again to load your repositories.':'Could not load repositories. Try connecting GitHub again.';
+    panel.append(link('Connect GitHub','/auth/github/start'));
+  }
+}

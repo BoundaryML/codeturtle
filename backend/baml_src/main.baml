@@ -124,6 +124,9 @@ class ReportService {
                     config("CODETURTLE_SLACK_CLIENT_SECRET"),
                 );
             }
+            if (route == "/api/github/repositories" && (req.method == "GET" || req.method == "POST")) {
+                return response(200, repository_picker(browser, req, self.github));
+            }
             if (route == "/api/session" && req.method == "GET") {
                 let session = browser.session(req);
                 return response(
