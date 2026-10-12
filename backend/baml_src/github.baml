@@ -4,28 +4,24 @@ class GitHubClient {
     app_id: string,
     private_key: string,
     bot_id: int,
+    tokens: BoundedCache,
+    contents: BoundedCache,
     function installation_token(self, e: Enrollment, write: bool = false) -> string {
         require(e.active, 403, "installation_inactive");
-        let jwt = self.crypto.sign(self.app_id, self.private_key);
-        let permissions: json = {
-            "contents": "read",
-            "actions": "read",
-            "pull_requests": if (write) {
-                "write"
-            } else {
-                "read"
-            },
-        };
-        str(
-            self.http.send(
-                "POST",
-                `https://api.github.com/app/installations/${e.installation_id}/access_tokens`,
-                jwt,
-                { "repository_ids": [baml.Int.parse(e.repository_id)], "permissions": permissions },
-            ),
-            "token",
-        )
+        let key = baml.json.stringify({"tenant": e.tenant_id, "installation": e.installation_id, "repository": e.repository_id, "write": write});
+        let data = self.tokens.get(key, 3000, () -> {
+            let jwt = self.crypto.sign(self.app_id, self.private_key);
+            let result = self.http.send("POST", `https://api.github.com/app/installations/${e.installation_id}/access_tokens`, jwt,
+                {"repository_ids": [baml.Int.parse(e.repository_id)], "permissions": {"contents":"read", "actions":"read", "pull_requests": if (write) {"write"} else {"read"}}});
+            // GitHub installation tokens last one hour; reject unexpectedly short-lived responses.
+            if let expiry: string = baml.json.to<string?>(field(result, "expires_at")) {
+                require((baml.time.Instant.parse(expiry) - baml.time.Instant.now()).to_seconds() > 3060n, 503, "short_lived_installation_token");
+            }
+            result
+        });
+        str(data, "token")
     }
+
     function api(
         self,
         method: string,
@@ -34,7 +30,9 @@ class GitHubClient {
         token: string,
         body: json = null,
     ) -> json {
-        self.http.send(method, "https://api.github.com/repos/" + repository + path, token, body)
+        self.http.send(method, "https://api.github.com/repos/" + repository + path, token, body) catch (e) {
+            let error: ApiError => { self.tokens.clear(); throw error; }
+        }
     }
     function authorize(self, i: RunIdentity, claims: json, e: Enrollment) -> AuthorizedRun {
         require(
@@ -58,14 +56,17 @@ class GitHubClient {
             num(run, "id").to_string() == i.run_id
                 && num(run, "run_attempt") == i.run_attempt
                 && str(run, "event") == "pull_request_target"
-                && str(run, "head_sha") == i.base
+                && str(run, "head_sha") == i.head
                 && str(run, "path") == workflow_path
                 && str(run, "status") == "in_progress",
             403,
             "run_mismatch",
         );
+        // GitHub can omit associations for pull_request_target runs. The run head
+        // and current PR head/base are still verified independently below.
+        let associations = baml.json.to<json[]>(field(run, "pull_requests"));
         require(
-            baml.json.to<json[]>(field(run, "pull_requests")).some((p) -> {
+            associations.length() == 0 || associations.some((p) -> {
                 num(p, "number") == i.pr
                     && num(field(field(p, "base"), "repo"), "id").to_string() == i.repository_id
             }),
@@ -97,6 +98,34 @@ class GitHubClient {
     function check_current(self, run: AuthorizedRun) -> void {
         let _ = self.current_pr(run.identity, self.installation_token(run.enrollment));
     }
+    function request_reviewers(self, run: StoredRun, token: string, pr: json, decisions: ReviewDecision[]) -> void {
+        let envelope = run.envelope;
+        if (envelope == null) { return; }
+        if (envelope.setup_failure != null || field(pr, "draft") == true) { return; }
+        let i = run.authorized.identity;
+        let requested = self.api("GET", i.repository, `/pulls/${i.pr}/requested_reviewers`, token);
+        let existing = baml.json.to<json[]>(field(requested, "users")).map((u) -> { str(u, "login").to_lower_case() });
+        let teams = baml.json.to<json[]>(field(requested, "teams")).map((t) -> { str(t, "slug").to_lower_case() });
+        // Do not re-request someone who already submitted a review for this head.
+        let page = 1;
+        while (true) {
+            let reviews = baml.json.to<json[]>(self.api("GET", i.repository, `/pulls/${i.pr}/reviews?per_page=100&page=${page}`, token));
+            for (let review in reviews) {
+                if (field(review, "commit_id") == i.head && field(review, "state") != "PENDING" && field(review, "state") != "DISMISSED" && field(review, "user") != null) {
+                    existing.push(str(field(review, "user"), "login").to_lower_case());
+                }
+            }
+            if (reviews.length() < 100) { break; }
+            require(page < 100, 503, "review_reconciliation_limit");
+            page += 1;
+        }
+        let owners = reviewer_rows(envelope.report, decisions, "", run.id).filter((r) -> { r.completed < r.indices.length() }).map((r) -> { r.owner });
+        let plan = native_review_requests(owners, str(field(pr, "user"), "login"), i.repository.split("/")[0], existing, teams);
+        if (baml.json.to<string[]>(field(plan, "reviewers")).length() > 0 || baml.json.to<string[]>(field(plan, "team_reviewers")).length() > 0) {
+            let _ = self.current_pr(i, token);
+            let _ = self.api("POST", i.repository, `/pulls/${i.pr}/requested_reviewers`, token, body = plan);
+        }
+    }
     function upsert_pr_comment(
         self,
         run: StoredRun,
@@ -106,7 +135,8 @@ class GitHubClient {
     ) -> CommentRef {
         let i = run.authorized.identity;
         let token = self.installation_token(run.authorized.enrollment, write = true);
-        let _ = self.current_pr(i, token);
+        let pr = self.current_pr(i, token);
+        self.request_reviewers(run, token, pr, decisions);
         let marker = `<!-- codeturtle:${i.repository_id}:${i.pr} -->`;
         let body = github_report(run, origin, decisions = decisions)
             + review_audit_markdown(events)
@@ -171,6 +201,9 @@ function github_report(run: StoredRun, origin: string, decisions: ReviewDecision
     if (e.setup_failure != null) {
         return text
             + "Evaluation setup failed. See the CI run for details. Human approval has not been determined.";
+    }
+    if (no_review_required(e.report)) {
+        return text + "No files match the configured review rules. No CodeTurtle review required";
     }
     let complete = baml.json.to<bool>(field(e.report, "evaluation_complete"));
     text
@@ -332,4 +365,44 @@ function review_audit_markdown(events: json[]) -> string {
     } else {
         text
     }
+}
+
+// GitHub cannot request a review from the PR author. Team slugs are scoped to
+// the repository organization; never reinterpret an unrelated org/team.
+function native_review_requests(owners: string[], author: string, organization: string, existing: string[], existing_teams: string[]) -> json {
+    let users: string[] = [];
+    let teams: string[] = [];
+    for (let owner in owners) {
+        let name = owner.to_lower_case();
+        if (name.starts_with("@")) { name = name.slice(1, name.length()); }
+        if (matches(name, "^[a-z0-9][a-z0-9-]*$")) {
+            if (name != author.to_lower_case() && !existing.includes(name) && !users.includes(name)) { users.push(name); }
+        } else if (matches(name, "^[a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9_-]*$")) {
+            let parts = name.split("/");
+            if (parts[0] == organization.to_lower_case() && !existing_teams.includes(parts[1]) && !teams.includes(parts[1])) { teams.push(parts[1]); }
+        }
+    }
+    {"reviewers": baml.json.from(users), "team_reviewers": baml.json.from(teams)}
+}
+
+test "Native requests omit author duplicates existing and foreign teams" {
+    assert.equal(native_review_requests(["@ATX24", "@alice", "@ALICE", "@bob", "@BoundaryML/core", "@elsewhere/core", "@"], "atx24", "BoundaryML", ["bob"], []), {"reviewers": ["alice"], "team_reviewers": ["core"]})
+}
+
+// An empty assignment list is safe to describe as out of scope only when
+// evaluation succeeded without errors. Setup failures are handled separately.
+function no_review_required(report: json) -> bool {
+    if (report == null) { return false; }
+    let requirements = baml.json.to<json[]?>(field(report, "requirements"));
+    let errors = baml.json.to<json[]?>(field(report, "errors"));
+    if (requirements == null || errors == null) { return false; }
+    requirements.length() == 0 && errors.length() == 0
+}
+
+test "No-review message excludes failed partial and missing reports" {
+    assert.equal(no_review_required({"requirements": [], "errors": [], "unowned_files": ["docs/intro.md"], "evaluation_complete": false}), true);
+    assert.equal(no_review_required({"requirements": [], "errors": [{"message": "Invalid policy"}]}), false);
+    assert.equal(no_review_required({"requirements": [{"path": "src/main.rs"}], "errors": [], "unowned_files": ["docs/intro.md"]}), false);
+    assert.equal(no_review_required(null), false);
+    assert.equal(no_review_required({"requirements": []}), false)
 }

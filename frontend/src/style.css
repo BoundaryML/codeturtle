@@ -32,7 +32,7 @@ button:focus-visible,select:focus-visible,textarea:focus-visible,summary:focus-v
   outline-offset:3px
 }
 code,pre,.review-count {
-  font-family:'Hack',monospace
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace
 }
 code {
   font-size:.9em
@@ -1467,3 +1467,7 @@ td,th {
 .preview-heading h2, .codeturtle-dialog h2 { font-weight: 600; }
 .file.selected { box-shadow: inset 2px 0 var(--accent); }
 @media(max-width:1000px) { .repo-name,.brand-divider { display:none; } }
+
+[hidden] { display:none !important; }
+.save-status { position:fixed; bottom:14px; left:50%; transform:translateX(-50%); z-index:20; background:#29252d; padding:10px 16px; border:1px solid var(--border); border-radius:8px; max-width:90vw; }
+.comment-card, .file-group { content-visibility:auto; contain-intrinsic-size:auto 72px; }

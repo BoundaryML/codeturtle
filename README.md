@@ -15,6 +15,10 @@ cli/       BAML policy engine, Python Git adapter and reporting transport,
 
 [CLI usage and policy reference](cli/README.md) · [Service configuration and deployment](backend/README.md)
 
+[BAML execution tracing and Studio setup](backend/STUDIO.md): start the service
+with `sh backend/start.sh`, then inspect same-machine recordings with
+`sh backend/traces.sh`.
+
 Install Python 3.10+, Git and BAML **0.20.2-nightly.20261004.a**, then:
 
 ```sh
@@ -23,6 +27,34 @@ codeturtle help
 npm --prefix frontend ci
 npm --prefix frontend run build
 ```
+
+## Test CodeTurtle on this repository
+
+The setup owner and initial reviewer is [@ATX24](https://github.com/ATX24).
+The root [CODETURTLE.md](CODETURTLE.md) assigns every changed file to `@ATX24`.
+
+The [CodeTurtle workflow](.github/workflows/codeturtle.yml) is part of this
+repository's [GitHub Actions suite](https://github.com/BoundaryML/codeturtle/actions/workflows/codeturtle.yml).
+It runs when a pull request is opened, updated, reopened, edited, or marked ready
+for review. It uses the policy from the PR's base revision and a pinned CLI.
+
+To test the complete review flow:
+
+1. Open a small PR against `main` in `BoundaryML/codeturtle` and wait for the
+   **CodeTurtle** Actions run to finish.
+2. Find the bot comment with the reviewer table. The `@ATX24` row should list the
+   changed parts and a personal review link.
+3. Open that link, sign in to [CodeTurtle](https://boundary-codeturtle-staging.fly.dev/),
+   and use the linked GitHub identity `ATX24`.
+4. Inspect each assigned file's diff. Choose **Approve** or **Reject** for every
+   file; a rejection requires a reason. Optional inline comments stay private
+   until submission.
+5. Click **Submit review**, reload the review page, and confirm the published
+   decisions persist and the PR comment updates your progress.
+
+This setup PR provides a small documentation diff for that manual test. Review
+submission is performed by `@ATX24`; it does not submit a native GitHub approval
+or merge the PR.
 
 The GitHub Action lives at `owner/repo/cli@full-commit-SHA`.
 Build the service image from this directory using `backend/Dockerfile`.
@@ -35,6 +67,7 @@ baml --agent-skill-check off test --directory backend
 backend/.venv/bin/python -m unittest discover -s backend/tests -p test_crypto.py -v
 CODETURTLE_TEST_SQL=/absolute/path/to/operator-handoff.md \
 CODETURTLE_TEST_REVIEW_SQL=/absolute/path/to/codeturtle-review-signoffs.md \
+CODETURTLE_TEST_PERFORMANCE_SQL=/absolute/path/to/codeturtle-workspace-performance-private.sql \
   backend/.venv/bin/python -m unittest discover -s backend/tests -p test_service.py -v
 npm --prefix frontend run build
 ```
@@ -75,3 +108,10 @@ GitHub handles work without that additional permission.
 The additive reviewer database migration must be applied before deploying this
 workspace. It is supplied separately as the operator SQL handoff. Deployment and
 publishing the updated GitHub Action are separate from local build/test success.
+
+## Public release status
+
+See [public setup and remaining release prerequisites](backend/PUBLIC_SETUP.md).
+Source CI requires no app credentials. The full app still requires the private
+database handoff; it is not independently reproducible from a public clone yet.
+The `heal/` experiment cannot execute candidates until isolated testing is implemented.

@@ -232,3 +232,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local review receiver credentials and generated planning pages
+plans/.reviews/
+
+# Database provisioning stays in the private operator handoff
+/backend/migrations/
+
+# Generated local benchmark output
+/backend/performance/

@@ -41,10 +41,14 @@ Install `backend/requirements.txt` in a Python virtual environment. Build the UI
 with `npm ci && npm run build` inside `frontend/`. Start from `backend/`:
 
 ```sh
-baml --agent-skill-check off run main -- --addr 0.0.0.0:8080
+sh start.sh
 ```
 
 Set these **CodeTurtle-specific** environment variables:
+
+The launcher records execution locally for Studio experiments. See
+[execution tracing](STUDIO.md) for queries, volume provisioning, and the separate
+full Studio server requirements. Set `BAML_TELEMETRY=off` to disable recording.
 
 | Variable | Value |
 | --- | --- |
@@ -151,4 +155,25 @@ live GitHub team membership checks and need organization Members read permission
 unverifiable membership never grants sign-off rights. Team rows represent a group
 owner; any verified member can satisfy that owner's slot. A reviewer can only remove
 their own decision. Diffs use immutable merge-base/head commits; binary/large or
-GitHub-truncated comparisons link back to the PR. No automatic GitHub review is submitted.
+GitHub-truncated comparisons link back to the PR. CodeTurtle submits a native GitHub approval after all required file sign-offs are satisfied.
+
+### Refresh a stale review
+
+When the base branch advances, old reviews remain blocked. A maintainer can apply the `codeturtle-refresh` label to the PR (remove and re-add it if already present) to create a new run against the current base and head. This uses the existing trusted `pull_request_target` path; rerunning an old Actions run retains its old event and is not sufficient. Existing installations must merge the updated workflow and verify setup again to trust its new blob. Refresh is explicit, not automatic on every base push.
+
+### Native GitHub review
+
+The GitHub delivery worker posts a review as the CodeTurtle app. It starts with a
+non-approving comment and submits `APPROVE` for the report's exact head only when
+all nonempty file requirements are satisfied by persisted CodeTurtle sign-offs.
+`Any` means one eligible owner per requirement; `All` means every listed owner.
+Incomplete evaluation, policy errors, setup failures and draft PRs cannot approve.
+Native GitHub approvals alone do not create CodeTurtle per-file sign-offs.
+
+Delivery retries reconcile reviews by bot identity and a run/head/base marker.
+Later rejections dismiss the approval on the next delivery. Signed pull-request
+webhooks compare the live head/base and dismiss obsolete approvals (including a
+conversion to draft). Base changes need a pull-request notification or a new
+report delivery to trigger reconciliation. GitHub's stale-approval dismissal
+setting is recommended as an independent safeguard for new commits.
+This review appears in GitHub's Reviewers list; it does not change branch rules.

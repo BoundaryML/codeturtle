@@ -12,3 +12,9 @@
 **/.env.*
 **/*.egg-info
 **/build
+
+# Local review receiver credentials and generated planning pages
+plans/.reviews/
+
+# Generated local benchmark output
+/backend/performance/

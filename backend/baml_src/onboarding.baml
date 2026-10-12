@@ -102,6 +102,9 @@ class Onboarding {
     }
     function verify_setup(self, req: baml.http.ServerRequest, repository_id: string) -> json {
         let _ = self.auth.authorize(req, repository_id);
+        self.activate_setup(repository_id)
+    }
+    function activate_setup(self, repository_id: string) -> json {
         let e = self.store.enrollment(repository_id);
         let state = self.store.rpc("setup_get", { "repository_id": repository_id });
         if (state == null) {
@@ -194,7 +197,7 @@ function setup_workflow(
     runtime_url: string,
     runtime_sha: string,
 ) -> string {
-    "name: CodeTurtle\non:\n  pull_request_target:\n    types: [opened, synchronize, reopened, edited]\npermissions:\n  contents: read\n  id-token: write\nconcurrency:\n  group: codeturtle-${{ github.event.pull_request.number }}\n  cancel-in-progress: true\njobs:\n  codeturtle:\n    runs-on: ubuntu-latest\n    timeout-minutes: 30\n    steps:\n      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          fetch-depth: 0\n          persist-credentials: false\n      - name: Fetch PR history without checking out PR code\n        env:\n          PR_NUMBER: ${{ github.event.pull_request.number }}\n          GH_TOKEN: ${{ github.token }}\n        run: |\n          auth=$(printf 'x-access-token:%s' \"$GH_TOKEN\" | base64 -w0)\n          git -c http.extraheader=\"AUTHORIZATION: basic $auth\" fetch --no-tags origin \"refs/pull/$PR_NUMBER/head\"\n      - uses: "
+    "name: CodeTurtle\non:\n  pull_request_target:\n    types: [opened, synchronize, reopened, edited, ready_for_review, labeled]\npermissions:\n  contents: read\n  id-token: write\njobs:\n  codeturtle:\n    if: github.event.action != 'labeled' || github.event.label.name == 'codeturtle-refresh'\n    concurrency:\n      group: codeturtle-${{ github.event.pull_request.number }}\n      cancel-in-progress: true\n    runs-on: ubuntu-latest\n    timeout-minutes: 30\n    steps:\n      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          fetch-depth: 0\n          persist-credentials: false\n      - name: Fetch PR history without checking out PR code\n        env:\n          PR_NUMBER: ${{ github.event.pull_request.number }}\n          GH_TOKEN: ${{ github.token }}\n        run: |\n          auth=$(printf 'x-access-token:%s' \"$GH_TOKEN\" | base64 -w0)\n          git -c http.extraheader=\"AUTHORIZATION: basic $auth\" fetch --no-tags origin \"refs/pull/$PR_NUMBER/head\"\n      - uses: "
         + action_ref
         + "\n        with:\n          api-url: '"
         + origin
@@ -333,6 +336,9 @@ test "Setup workflow uses trusted base and one job" {
     );
     assert.contains(workflow, "pull_request_target");
     assert.contains(workflow, "persist-credentials: false");
+    assert.contains(workflow, "ready_for_review, labeled");
+    assert.contains(workflow, "github.event.label.name == 'codeturtle-refresh'");
+    assert.contains(workflow, "    concurrency:");
     assert.contains(workflow, "ref: ${{ github.event.pull_request.base.sha }}")
 }
 
@@ -361,7 +367,7 @@ function start_setup(
         q.get("repository_id") ?? ""
     };
     require(
-        matches(installation, "^[1-9][0-9]*$") && matches(repository, "^[1-9][0-9]*$"),
+        (installation == "" && repository == "") || (matches(installation, "^[1-9][0-9]*$") && matches(repository, "^[1-9][0-9]*$")),
         400,
         "installation_and_repository_required",
     );
@@ -421,6 +427,14 @@ function complete_setup(
     let user = github.http.send("GET", "https://api.github.com/user", token, null);
     let installation_id = str(data, "installation_id");
     let repository_id = str(data, "repository_id");
+    if (installation_id == "" && repository_id == "") {
+        let credential = secrets.seal(
+            baml.json.stringify({"bundle": github_token_bundle(exchange), "expires_at": now() + 600}),
+            "github-picker:" + str(session, "csrf"),
+        );
+        require(credential.length() < 3800, 503, "github_credential_too_large");
+        return redirect("/?connect=github", set_cookie = "__Host-ct_picker=" + credential + "; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=600");
+    }
     let page = 1;
     let selected: json = null;
     while (page <= 100) {
@@ -455,7 +469,7 @@ function complete_setup(
                 "repository_id": repository_id,
                 "installation_id": installation_id,
                 "github_user_id": num(user, "id").to_string(),
-                "encrypted_token": secrets.seal(token, "github-user:" + actor.user_id + ":" + repository_id),
+                "encrypted_token": secrets.seal(github_token_bundle(exchange), "github-user:" + actor.user_id + ":" + repository_id),
             },
         );
         return redirect(safe_return(baml.json.to<string?>(field(data, "next")) ?? "/"));
@@ -485,8 +499,77 @@ function complete_setup(
             "actor": baml.json.from(actor),
             "enrollment": baml.json.from(enrolled),
             "github_user_id": num(user, "id").to_string(),
-            "encrypted_token": secrets.seal(token, "github-user:" + actor.user_id + ":" + repository_id),
+            "encrypted_token": secrets.seal(github_token_bundle(exchange), "github-user:" + actor.user_id + ":" + repository_id),
         },
     );
     redirect("/?repository=" + repository_id)
+}
+
+// Discovery credentials are encrypted, short-lived, and bound to this browser session.
+function picker_bundle(auth: BrowserAuth, req: baml.http.ServerRequest, session: json) -> string {
+    let encrypted = cookie(req, "__Host-ct_picker");
+    require(encrypted != "", 403, "github_connect_required");
+    let data = baml.json.parse(auth.secrets.open(encrypted, "github-picker:" + str(session, "csrf"))) catch_all (_) {
+        _ => throw ApiError {status: 403, code: "github_connect_required"},
+    };
+    require(num(data, "expires_at") > now(), 403, "github_connect_required");
+    str(data, "bundle")
+}
+
+function discover_repositories(http: Transport, token: string, app_id: string) -> json[] {
+    let found: json[] = [];
+    let page = 1;
+    while (page <= 100) {
+        let data = github_user_get(http, `https://api.github.com/user/installations?per_page=100&page=${page}`, token);
+        let installations = baml.json.to<json[]>(field(data, "installations"));
+        for (let installation in installations) {
+            if (num(installation, "app_id").to_string() == app_id && field(installation, "suspended_at") == null) {
+                let installation_id = num(installation, "id").to_string();
+                let repo_page = 1;
+                while (repo_page <= 100) {
+                    let result = github_user_get(http, `https://api.github.com/user/installations/${installation_id}/repositories?per_page=100&page=${repo_page}`, token);
+                    let repos = baml.json.to<json[]>(field(result, "repositories"));
+                    for (let repo in repos) {
+                        if (field(field(repo, "permissions"), "admin") == true && field(repo, "archived") != true) {
+                            found.push({"id": num(repo, "id").to_string(), "name": str(repo, "full_name"), "installation_id": installation_id, "default_branch": str(repo, "default_branch")});
+                        }
+                    }
+                    if (repos.length() < 100) { break; }
+                    repo_page += 1;
+                }
+            }
+        }
+        if (installations.length() < 100) { break; }
+        page += 1;
+    }
+    found
+}
+
+function repository_picker(auth: BrowserAuth, req: baml.http.ServerRequest, github: GitHubClient) -> json {
+    let session = auth.session(req, mutation = req.method == "POST");
+    let bundle = picker_bundle(auth, req, session);
+    let token = str(baml.json.parse(bundle), "access_token");
+    //# Discover repositories the signed-in user can administer through this app.
+    let repositories = discover_repositories(github.http, token, github.app_id);
+    if (req.method == "GET") { return {"repositories": repositories}; }
+    let body = baml.json.parse(req.body);
+    let selected = repositories.find((r) -> { str(r, "id") == str(body, "repository_id") })
+        ?? throw ApiError {status: 403, code: "repository_admin_required"};
+    let actor = baml.json.to<Actor>(field(session, "actor"));
+    let user = github_user_get(github.http, "https://api.github.com/user", token);
+    let id = str(selected, "id");
+    let repository = str(selected, "name");
+    let enrolled = Enrollment {
+        repository_id: id, repository: repository, tenant_id: actor.tenant_id,
+        installation_id: baml.Int.parse(str(selected, "installation_id")),
+        workflow_ref: repository + "/.github/workflows/codeturtle.yml@refs/heads/" + str(selected, "default_branch"),
+        workflow_blob: "", active: true, slack: null,
+    };
+    //# Recheck live access before linking the selected repository.
+    let _ = auth.store.rpc("link_repository", {
+        "actor": baml.json.from(actor), "enrollment": baml.json.from(enrolled),
+        "github_user_id": num(user, "id").to_string(),
+        "encrypted_token": auth.secrets.seal(bundle, "github-user:" + actor.user_id + ":" + id),
+    });
+    {"repository_id": id}
 }
